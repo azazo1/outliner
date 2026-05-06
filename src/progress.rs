@@ -15,7 +15,7 @@ use tracing_subscriber::{EnvFilter, Layer};
 
 static TRACING_INIT: Once = Once::new();
 
-const DEFAULT_LOG_FILTER: &str = "warn";
+const DEFAULT_LOG_FILTER: &str = "info";
 const STAGE_COUNT: u64 = 9;
 const MAX_PROGRESS_MESSAGE_LEN: usize = 72;
 const MAX_PROGRESS_PATH_LEN: usize = 48;
