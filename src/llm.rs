@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use futures_util::StreamExt;
+use http::HeaderMap;
 use rig::OneOrMany;
 use rig::agent::MultiTurnStreamItem;
 use rig::client::completion::CompletionClient;
@@ -212,7 +213,15 @@ fn build_openai_client(config: &LlmConfig) -> Result<openai::Client> {
         .filter(|value| !value.is_empty())
         .context("missing OpenAI API key, set `api_key` in config.toml or OPENAI_API_KEY in the environment")?;
 
-    let mut builder = openai::Client::builder().api_key(api_key);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+
+    let mut builder = openai::Client::builder()
+        .api_key(api_key)
+        .http_headers(headers);
     if let Some(base_url) = config
         .api_base
         .clone()
