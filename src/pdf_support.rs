@@ -67,13 +67,26 @@ impl PdfWorkspace {
         Ok(selected)
     }
 
+    #[allow(dead_code)]
     pub fn render_pages(&self, pages: &[usize]) -> Result<Vec<RenderedPage>> {
+        self.render_pages_with_progress(pages, |_, _| {})
+    }
+
+    pub fn render_pages_with_progress<F>(
+        &self,
+        pages: &[usize],
+        mut on_page: F,
+    ) -> Result<Vec<RenderedPage>>
+    where
+        F: FnMut(usize, usize),
+    {
         let mut rendered = Vec::with_capacity(pages.len());
-        for &physical_page in pages {
+        for (index, &physical_page) in pages.iter().enumerate() {
             rendered.push(RenderedPage {
                 physical_page,
                 png_bytes: render_page_png_bytes(&self.pdf_path, physical_page)?,
             });
+            on_page(index + 1, physical_page);
         }
         Ok(rendered)
     }
@@ -124,6 +137,7 @@ impl PdfWorkspace {
             .and_then(|(offset, score)| (score >= 2).then_some(offset))
     }
 
+    #[allow(dead_code)]
     pub fn calibrate_entries(
         &self,
         entries: &[crate::model::TocCandidateEntry],
@@ -131,6 +145,26 @@ impl PdfWorkspace {
         anchor_window: usize,
         anchor_budget: usize,
     ) -> Result<Vec<OutlineEntry>> {
+        self.calibrate_entries_with_progress(
+            entries,
+            observations,
+            anchor_window,
+            anchor_budget,
+            |_, _| {},
+        )
+    }
+
+    pub fn calibrate_entries_with_progress<F>(
+        &self,
+        entries: &[crate::model::TocCandidateEntry],
+        observations: &[VisionPageObservation],
+        anchor_window: usize,
+        anchor_budget: usize,
+        mut on_entry: F,
+    ) -> Result<Vec<OutlineEntry>>
+    where
+        F: FnMut(usize, &str),
+    {
         let fallback_offset = observations
             .last()
             .map(|page| page.physical_page as isize)
@@ -142,7 +176,7 @@ impl PdfWorkspace {
         let mut remaining_anchor_checks = anchor_budget;
         let mut calibrated = Vec::with_capacity(entries.len());
 
-        for entry in entries {
+        for (index, entry) in entries.iter().enumerate() {
             let label = parse_page_label(&entry.page_label);
             let mut physical_page = resolve_physical_page(&label, offset, self.page_count);
 
@@ -180,6 +214,7 @@ impl PdfWorkspace {
                 physical_page,
                 printed_page_label: label,
             });
+            on_entry(index + 1, &entry.title);
         }
 
         Ok(calibrated)

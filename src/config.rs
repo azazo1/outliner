@@ -22,7 +22,11 @@ pub struct CliArgs {
     pub output: Option<PathBuf>,
     #[arg(long)]
     pub model: Option<String>,
-    #[arg(long, value_name = "PATH", help = "Config file path, defaults to ~/.config/outliner/config.toml")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Config file path, defaults to ~/.config/outliner/config.toml"
+    )]
     pub config: Option<PathBuf>,
     #[arg(long)]
     pub front_pages: Option<usize>,
@@ -113,7 +117,10 @@ fn merge_args(cli: CliArgs, file: FileConfig) -> Result<AppArgs> {
         model: normalize_optional_string(cli.model.or(file.model)),
         api_base: normalize_optional_string(file.api_base),
         api_key: normalize_optional_string(file.api_key),
-        front_pages: cli.front_pages.or(file.front_pages).unwrap_or(DEFAULT_FRONT_PAGES),
+        front_pages: cli
+            .front_pages
+            .or(file.front_pages)
+            .unwrap_or(DEFAULT_FRONT_PAGES),
         max_toc_pages: cli
             .max_toc_pages
             .or(file.max_toc_pages)

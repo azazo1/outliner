@@ -156,7 +156,7 @@ fn is_roman_numeral(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{TocCandidateEntry, sanitize_title, normalize_toc_entries, parse_page_label};
+    use super::{TocCandidateEntry, normalize_toc_entries, parse_page_label, sanitize_title};
 
     #[test]
     fn normalize_keeps_hierarchy_contiguous() {
