@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.100"
+base64 = "0.22.1"
 clap = { version = "4.6.1", features = ["derive"] }
 qpdf = "0.3.5"
+regex = "1.12.2"
 rig-core = "0.36.0"
+schemars = { version = "1.2.1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tempfile = "3.23.0"
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
