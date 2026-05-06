@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, bail};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use rig::OneOrMany;
-use rig::client::ProviderClient;
 use rig::message::{Image, ImageDetail, ImageMediaType, Message, UserContent};
 use rig::providers::openai;
 use schemars::JsonSchema;
@@ -26,6 +25,8 @@ Rules:
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
     pub model: Option<String>,
+    pub api_base: Option<String>,
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -47,7 +48,7 @@ pub async fn extract_toc(config: &LlmConfig, pages: &[RenderedPage]) -> Result<T
         bail!("no candidate pages were provided to the LLM extractor");
     }
 
-    let client = openai::Client::from_env().context("failed to initialize OpenAI client")?;
+    let client = build_openai_client(config)?;
     let model = config.model.as_deref().unwrap_or(openai::GPT_4O_MINI);
     let extractor = client
         .extractor::<TocExtraction>(model)
@@ -69,7 +70,7 @@ pub async fn observe_page_labels(
         return Ok(Vec::new());
     }
 
-    let client = openai::Client::from_env().context("failed to initialize OpenAI client")?;
+    let client = build_openai_client(config)?;
     let model = config.model.as_deref().unwrap_or(openai::GPT_4O_MINI);
     let extractor = client
         .extractor::<VisionPageObservationBatch>(model)
@@ -107,4 +108,29 @@ fn build_multimodal_message(pages: &[RenderedPage], instruction: &str) -> Result
     Ok(Message::User {
         content: OneOrMany::many(content).context("multimodal prompt cannot be empty")?,
     })
+}
+
+fn build_openai_client(config: &LlmConfig) -> Result<openai::Client> {
+    let api_key = config
+        .api_key
+        .clone()
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .context("missing OpenAI API key, set `api_key` in config.toml or OPENAI_API_KEY in the environment")?;
+
+    let mut builder = openai::Client::builder().api_key(api_key);
+    if let Some(base_url) = config
+        .api_base
+        .clone()
+        .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        builder = builder.base_url(base_url);
+    }
+
+    builder
+        .build()
+        .context("failed to initialize OpenAI client")
 }

@@ -1,3 +1,4 @@
+mod config;
 mod llm;
 mod model;
 mod pdf_support;
@@ -12,34 +13,16 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::{
+    config::{AppArgs, CliArgs, resolve_args},
     llm::{LlmConfig, extract_toc},
     model::{RunOutcome, normalize_outline_for_compare, normalize_toc_entries, parse_page_label},
     pdf_support::PdfWorkspace,
     qpdf_outline::{open_pdf, read_existing_outline, write_outline},
 };
 
-#[derive(Debug, Parser)]
-#[command(author, version, about)]
-struct Args {
-    #[arg()]
-    input: PathBuf,
-    #[arg(long)]
-    output: Option<PathBuf>,
-    #[arg(long)]
-    model: Option<String>,
-    #[arg(long, default_value_t = 20)]
-    front_pages: usize,
-    #[arg(long, default_value_t = 6)]
-    max_toc_pages: usize,
-    #[arg(long, default_value_t = 3)]
-    anchor_window: usize,
-    #[arg(long, default_value_t = 40)]
-    anchor_budget: usize,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let args = resolve_args(CliArgs::parse())?;
     let outcome = run(args).await?;
 
     match outcome {
@@ -65,7 +48,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run(args: Args) -> Result<RunOutcome> {
+async fn run(args: AppArgs) -> Result<RunOutcome> {
     let pdf = open_pdf(&args.input)?;
     let page_count = pdf
         .get_num_pages()
@@ -82,6 +65,8 @@ async fn run(args: Args) -> Result<RunOutcome> {
 
     let llm_config = LlmConfig {
         model: args.model.clone(),
+        api_base: args.api_base.clone(),
+        api_key: args.api_key.clone(),
     };
     let extracted = extract_toc(&llm_config, &rendered_pages).await?;
     let toc_entries = normalize_toc_entries(extracted.entries);
