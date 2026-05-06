@@ -11,7 +11,7 @@ use tempfile::TempDir;
 use crate::{
     llm::VisionPageObservation,
     model::{
-        CandidatePage, OutlineEntry, PageLabel, RenderedPage, normalize_title, parse_page_label,
+        CandidatePage, OutlineEntry, PageLabel, RenderedPage, parse_page_label, sanitize_title,
     },
 };
 
@@ -150,24 +150,24 @@ impl PdfWorkspace {
                 physical_page = self.find_roman_page(&label);
             }
 
-            if remaining_anchor_checks > 0 {
-                if let Some(current_page) = physical_page {
-                    if let Some(refined) =
-                        self.refine_with_title_anchor(&entry.title, current_page, anchor_window)?
-                    {
-                        physical_page = Some(refined);
-                    }
-                    remaining_anchor_checks -= 1;
+            if remaining_anchor_checks > 0
+                && let Some(current_page) = physical_page
+            {
+                if let Some(refined) =
+                    self.refine_with_title_anchor(&entry.title, current_page, anchor_window)?
+                {
+                    physical_page = Some(refined);
                 }
+                remaining_anchor_checks -= 1;
             }
 
             let physical_page = physical_page.unwrap_or_else(|| {
                 clamp_page_number(
                     label
                         .as_ref()
-                        .and_then(|page_label| match page_label {
-                            PageLabel::Arabic(number) => Some(*number as isize + offset),
-                            PageLabel::Roman(_) => Some(1),
+                        .map(|page_label| match page_label {
+                            PageLabel::Arabic(number) => *number as isize + offset,
+                            PageLabel::Roman(_) => 1,
                         })
                         .unwrap_or(1),
                     self.page_count,
@@ -200,7 +200,7 @@ impl PdfWorkspace {
         guess: usize,
         window: usize,
     ) -> Result<Option<usize>> {
-        let target = normalize_title(title);
+        let target = sanitize_title(title);
         if target.len() < 6 {
             return Ok(None);
         }
@@ -346,12 +346,11 @@ fn detect_printed_page_labels(text: &str) -> Vec<PageLabel> {
         .collect::<Vec<_>>();
 
     for line in candidates {
-        if let Some(captures) = re.captures(line) {
-            if let Some(value) = captures.get(1).map(|m| m.as_str()) {
-                if let Some(label) = parse_page_label(value) {
-                    labels.push(label);
-                }
-            }
+        if let Some(captures) = re.captures(line)
+            && let Some(value) = captures.get(1).map(|m| m.as_str())
+            && let Some(label) = parse_page_label(value)
+        {
+            labels.push(label);
         }
     }
 
@@ -376,6 +375,6 @@ fn clamp_page_number(number: isize, page_count: usize) -> usize {
 }
 
 fn looks_like_heading_match(normalized_title: &str, page_text: &str) -> bool {
-    let normalized_page = normalize_title(page_text);
+    let normalized_page = sanitize_title(page_text);
     normalized_page.contains(normalized_title)
 }

@@ -110,7 +110,7 @@ pub fn normalize_outline_for_compare(
     entries
         .into_iter()
         .map(|(title, level, physical_page)| NormalizedOutlineEntry {
-            title: normalize_title(&title),
+            title: sanitize_title(&title),
             level,
             physical_page,
         })
@@ -127,8 +127,8 @@ pub fn clean_title(input: &str) -> String {
         .to_string()
 }
 
-pub fn normalize_title(input: &str) -> String {
-    let re = Regex::new(r"[\p{White_Space}\p{P}\p{S}]+").expect("title normalization regex");
+pub fn sanitize_title(input: &str) -> String {
+    let re = Regex::new(r"[\p{White_Space}\p{P}\p{S}]+").expect("title sanitize regex");
     re.replace_all(&input.to_lowercase(), "").into_owned()
 }
 
@@ -156,7 +156,7 @@ fn is_roman_numeral(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{TocCandidateEntry, normalize_title, normalize_toc_entries, parse_page_label};
+    use super::{TocCandidateEntry, sanitize_title, normalize_toc_entries, parse_page_label};
 
     #[test]
     fn normalize_keeps_hierarchy_contiguous() {
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn normalize_title_drops_fillers() {
-        assert_eq!(normalize_title("Chapter 1 .... 3"), "chapter13");
+        assert_eq!(sanitize_title("Chapter 1 .... 3"), "chapter13");
     }
 
     #[test]

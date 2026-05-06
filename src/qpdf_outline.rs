@@ -242,10 +242,10 @@ fn build_named_destination_map(
     if let Some(dests) = root.get("/Dests") {
         let dest_dict: QPdfDictionary = dests.into();
         for key in dest_dict.keys() {
-            if let Some(value) = dest_dict.get(&key) {
-                if let Some(page) = resolve_destination(value, page_map, &HashMap::new()) {
-                    map.insert(key, page);
-                }
+            if let Some(value) = dest_dict.get(&key)
+                && let Some(page) = resolve_destination(value, page_map, &HashMap::new())
+            {
+                map.insert(key, page);
             }
         }
     }
@@ -272,10 +272,10 @@ fn collect_name_tree_destinations(
                     }
                 })
                 .unwrap_or_default();
-            if let Some(value) = names_array.get(index + 1) {
-                if let Some(page) = resolve_destination(value, page_map, &HashMap::new()) {
-                    map.insert(key, page);
-                }
+            if let Some(value) = names_array.get(index + 1)
+                && let Some(page) = resolve_destination(value, page_map, &HashMap::new())
+            {
+                map.insert(key, page);
             }
             index += 2;
         }
