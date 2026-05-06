@@ -204,15 +204,19 @@ impl PdfWorkspace {
 
         let start = guess.saturating_sub(window).max(1);
         let end = (guess + window).min(self.page_count);
+        let mut best_match = None;
+        let mut best_score = 0usize;
 
         for physical_page in start..=end {
             let text = self.page_text_for_matching(physical_page)?;
-            if looks_like_heading_match(&target, &text) {
-                return Ok(Some(physical_page));
+            let score = heading_match_score(&target, &text, guess, physical_page);
+            if score > best_score {
+                best_score = score;
+                best_match = Some(physical_page);
             }
         }
 
-        Ok(None)
+        Ok((best_score >= 3).then_some(best_match).flatten())
     }
 
     fn find_roman_page(&self, label: &Option<PageLabel>) -> Option<usize> {
@@ -463,14 +467,89 @@ fn clamp_page_number(number: isize, page_count: usize) -> usize {
     number.clamp(1, page_count as isize) as usize
 }
 
-fn looks_like_heading_match(normalized_title: &str, page_text: &str) -> bool {
-    let normalized_page = sanitize_title(page_text);
-    normalized_page.contains(normalized_title)
+fn heading_match_score(
+    normalized_title: &str,
+    page_text: &str,
+    guess: usize,
+    page: usize,
+) -> usize {
+    let mut best_score = 0usize;
+
+    for line in page_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let normalized_line = sanitize_title(trimmed);
+        if normalized_line.is_empty() || !normalized_line.contains(normalized_title) {
+            continue;
+        }
+
+        let mut score = 1usize;
+        if normalized_line == normalized_title {
+            score += 4;
+        } else if normalized_line.starts_with(normalized_title) {
+            score += 2;
+        }
+
+        if trimmed.len() <= 120 {
+            score += 1;
+        }
+
+        if looks_like_heading_line(trimmed) {
+            score += 2;
+        }
+
+        best_score = best_score.max(score);
+    }
+
+    if best_score == 0 {
+        let normalized_page = sanitize_title(page_text);
+        if normalized_page.contains(normalized_title) {
+            best_score = 1;
+        }
+    }
+
+    if best_score == 0 {
+        return 0;
+    }
+
+    if page >= guess {
+        best_score += 1;
+    }
+
+    if page == guess {
+        best_score += 1;
+    }
+
+    best_score
+}
+
+fn looks_like_heading_line(line: &str) -> bool {
+    let alpha_count = line.chars().filter(|ch| ch.is_alphanumeric()).count();
+    if alpha_count == 0 {
+        return false;
+    }
+
+    let trailing_punct = line.ends_with(':')
+        || line.ends_with('：')
+        || line.ends_with('.')
+        || line.ends_with(')')
+        || line.ends_with('）');
+    let uppercase_prefix = line
+        .chars()
+        .take_while(|ch| ch.is_alphabetic())
+        .take(8)
+        .all(|ch| !ch.is_lowercase());
+
+    trailing_punct || uppercase_prefix || alpha_count <= 80
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CandidatePage, score_toc_page, select_candidate_toc_pages};
+    use super::{CandidatePage, heading_match_score, score_toc_page, select_candidate_toc_pages};
+    use crate::model::sanitize_title;
 
     #[test]
     fn score_prefers_early_real_toc_pages() {
@@ -510,5 +589,17 @@ mod tests {
             .map(|page| page.physical_page)
             .collect::<Vec<_>>();
         assert_eq!(pages, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn heading_match_prefers_real_heading_over_body_mention() {
+        let title = "六. 提交要求";
+        let body_page = "本节先概述六. 提交要求的背景, 具体内容见下一页。";
+        let heading_page = "六. 提交要求\n这里开始正式内容。";
+
+        assert!(
+            heading_match_score(&sanitize_title(title), heading_page, 10, 10)
+                > heading_match_score(&sanitize_title(title), body_page, 10, 9)
+        );
     }
 }
