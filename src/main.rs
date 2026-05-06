@@ -47,7 +47,9 @@ async fn main() -> Result<()> {
             println!("Stopped: {reason}");
         }
         RunOutcome::AlreadyAligned { entries } => {
-            println!("Stopped: existing outline already matches the table of contents ({entries} entries).");
+            println!(
+                "Stopped: existing outline already matches the table of contents ({entries} entries)."
+            );
         }
         RunOutcome::Updated {
             output_path,
@@ -70,10 +72,7 @@ async fn run(args: Args) -> Result<RunOutcome> {
         .context("failed to read PDF page count")? as usize;
 
     let workspace = PdfWorkspace::new(args.input.clone(), page_count)?;
-    let candidate_pages = workspace.candidate_toc_pages(
-        args.front_pages,
-        args.max_toc_pages,
-    )?;
+    let candidate_pages = workspace.candidate_toc_pages(args.front_pages, args.max_toc_pages)?;
     let rendered_pages = workspace.render_pages(
         &candidate_pages
             .iter()
@@ -81,15 +80,17 @@ async fn run(args: Args) -> Result<RunOutcome> {
             .collect::<Vec<_>>(),
     )?;
 
-    let llm_config = LlmConfig { model: args.model.clone() };
+    let llm_config = LlmConfig {
+        model: args.model.clone(),
+    };
     let extracted = extract_toc(&llm_config, &rendered_pages).await?;
     let toc_entries = normalize_toc_entries(extracted.entries);
 
     if !extracted.toc_found || toc_entries.len() < 2 {
         return Ok(RunOutcome::NoTocFound {
-            reason: extracted
-                .notes
-                .unwrap_or_else(|| "the PDF does not contain a reliable table of contents".to_string()),
+            reason: extracted.notes.unwrap_or_else(|| {
+                "the PDF does not contain a reliable table of contents".to_string()
+            }),
         });
     }
 
@@ -143,7 +144,9 @@ async fn run(args: Args) -> Result<RunOutcome> {
 }
 
 fn determine_output_path(input: &Path, output: Option<&Path>) -> PathBuf {
-    output.map(Path::to_path_buf).unwrap_or_else(|| input.to_path_buf())
+    output
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| input.to_path_buf())
 }
 
 fn temporary_output_path(input: &Path) -> PathBuf {
@@ -161,5 +164,8 @@ fn same_path(left: &Path, right: &Path) -> bool {
 
 #[allow(dead_code)]
 fn _page_label_is_numeric(value: &str) -> bool {
-    matches!(parse_page_label(value), Some(crate::model::PageLabel::Arabic(_)))
+    matches!(
+        parse_page_label(value),
+        Some(crate::model::PageLabel::Arabic(_))
+    )
 }

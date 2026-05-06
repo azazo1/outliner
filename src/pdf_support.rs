@@ -10,7 +10,9 @@ use tempfile::TempDir;
 
 use crate::{
     llm::VisionPageObservation,
-    model::{CandidatePage, OutlineEntry, PageLabel, RenderedPage, normalize_title, parse_page_label},
+    model::{
+        CandidatePage, OutlineEntry, PageLabel, RenderedPage, normalize_title, parse_page_label,
+    },
 };
 
 pub struct PdfWorkspace {
@@ -150,11 +152,9 @@ impl PdfWorkspace {
 
             if remaining_anchor_checks > 0 {
                 if let Some(current_page) = physical_page {
-                    if let Some(refined) = self.refine_with_title_anchor(
-                        &entry.title,
-                        current_page,
-                        anchor_window,
-                    )? {
+                    if let Some(refined) =
+                        self.refine_with_title_anchor(&entry.title, current_page, anchor_window)?
+                    {
                         physical_page = Some(refined);
                     }
                     remaining_anchor_checks -= 1;
@@ -163,7 +163,8 @@ impl PdfWorkspace {
 
             let physical_page = physical_page.unwrap_or_else(|| {
                 clamp_page_number(
-                    label.as_ref()
+                    label
+                        .as_ref()
                         .and_then(|page_label| match page_label {
                             PageLabel::Arabic(number) => Some(*number as isize + offset),
                             PageLabel::Roman(_) => Some(1),
@@ -225,7 +226,10 @@ impl PdfWorkspace {
 
         for (index, text) in self.text_pages.iter().enumerate() {
             let labels = detect_printed_page_labels(text);
-            if labels.iter().any(|candidate| candidate == &PageLabel::Roman(target.clone())) {
+            if labels
+                .iter()
+                .any(|candidate| candidate == &PageLabel::Roman(target.clone()))
+            {
                 return Some(index + 1);
             }
         }
@@ -279,7 +283,8 @@ fn split_pdftotext_output(output: &str, expected_pages: usize) -> Vec<String> {
 }
 
 fn render_page_png_bytes(pdf_path: &Path, physical_page: usize) -> Result<Vec<u8>> {
-    let temp_dir = TempDir::new().context("failed to create temporary directory for page rendering")?;
+    let temp_dir =
+        TempDir::new().context("failed to create temporary directory for page rendering")?;
     let prefix = temp_dir.path().join("page");
 
     let output = Command::new("pdftoppm")
@@ -306,12 +311,15 @@ fn render_page_png_bytes(pdf_path: &Path, physical_page: usize) -> Result<Vec<u8
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .find(|path| path.extension().is_some_and(|ext| ext == "png"))
         .context("pdftoppm did not produce a PNG file")?;
-    std::fs::read(&image_path).with_context(|| format!("failed to read rendered page {}", image_path.display()))
+    std::fs::read(&image_path)
+        .with_context(|| format!("failed to read rendered page {}", image_path.display()))
 }
 
 fn score_toc_page(text: &str) -> usize {
-    let title_re = Regex::new(r"(?im)\b(contents|table of contents)\b|目录").expect("toc title regex");
-    let line_re = Regex::new(r"(?im)^.{2,}?(\.{2,}|\s)\s*([ivxlcdm]+|\d{1,4})\s*$").expect("toc line regex");
+    let title_re =
+        Regex::new(r"(?im)\b(contents|table of contents)\b|目录").expect("toc title regex");
+    let line_re =
+        Regex::new(r"(?im)^.{2,}?(\.{2,}|\s)\s*([ivxlcdm]+|\d{1,4})\s*$").expect("toc line regex");
 
     let mut score = 0;
     if title_re.is_match(text) {
@@ -350,9 +358,15 @@ fn detect_printed_page_labels(text: &str) -> Vec<PageLabel> {
     labels
 }
 
-fn resolve_physical_page(label: &Option<PageLabel>, offset: isize, page_count: usize) -> Option<usize> {
+fn resolve_physical_page(
+    label: &Option<PageLabel>,
+    offset: isize,
+    page_count: usize,
+) -> Option<usize> {
     match label {
-        Some(PageLabel::Arabic(number)) => Some(clamp_page_number(*number as isize + offset, page_count)),
+        Some(PageLabel::Arabic(number)) => {
+            Some(clamp_page_number(*number as isize + offset, page_count))
+        }
         Some(PageLabel::Roman(_)) | None => None,
     }
 }

@@ -95,7 +95,9 @@ fn build_multimodal_message(pages: &[RenderedPage], instruction: &str) -> Result
             page.physical_page
         )));
         content.push(UserContent::Image(Image {
-            data: rig::message::DocumentSourceKind::base64(&BASE64_STANDARD.encode(&page.png_bytes)),
+            data: rig::message::DocumentSourceKind::base64(
+                &BASE64_STANDARD.encode(&page.png_bytes),
+            ),
             media_type: Some(ImageMediaType::PNG),
             detail: Some(ImageDetail::High),
             additional_params: None,

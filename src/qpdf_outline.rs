@@ -50,7 +50,12 @@ pub fn write_outline(pdf: &QPdf, entries: &[OutlineEntry], output_path: &Path) -
     for entry in entries {
         let page = pages
             .get(entry.physical_page.saturating_sub(1))
-            .with_context(|| format!("outline target page {} is out of range", entry.physical_page))?;
+            .with_context(|| {
+                format!(
+                    "outline target page {} is out of range",
+                    entry.physical_page
+                )
+            })?;
         let dest = pdf.new_array_from(vec![page.as_ref().clone(), pdf.new_name("/Fit")]);
         let item: QPdfDictionary = pdf
             .new_dictionary_from([
@@ -88,7 +93,9 @@ pub fn write_outline(pdf: &QPdf, entries: &[OutlineEntry], output_path: &Path) -
             current.set("/First", item_objects[*first_child].as_ref().clone());
             current.set(
                 "/Last",
-                item_objects[*node.children.last().expect("child exists")].as_ref().clone(),
+                item_objects[*node.children.last().expect("child exists")]
+                    .as_ref()
+                    .clone(),
             );
             current.set("/Count", pdf.new_integer(node.descendant_count as i64));
         }
@@ -100,16 +107,15 @@ pub fn write_outline(pdf: &QPdf, entries: &[OutlineEntry], output_path: &Path) -
     let mut writer = pdf.writer();
     writer.preserve_unreferenced_objects(false);
     writer.static_id(true);
-    writer.write(output_path).with_context(|| {
-        format!(
-            "failed to write outlined PDF to {}",
-            output_path.display()
-        )
-    })
+    writer
+        .write(output_path)
+        .with_context(|| format!("failed to write outlined PDF to {}", output_path.display()))
 }
 
 fn build_page_map(pdf: &QPdf) -> Result<HashMap<(u32, u32), usize>> {
-    let pages = pdf.get_pages().context("failed to load pages while building page map")?;
+    let pages = pdf
+        .get_pages()
+        .context("failed to load pages while building page map")?;
     let mut page_map = HashMap::new();
 
     for (index, page) in pages.iter().enumerate() {
@@ -342,7 +348,10 @@ fn build_outline_tree(entries: &[OutlineEntry]) -> OutlineTree {
         update_descendant_counts(*root_index, &mut nodes);
     }
 
-    OutlineTree { nodes, root_indices }
+    OutlineTree {
+        nodes,
+        root_indices,
+    }
 }
 
 fn update_descendant_counts(index: usize, nodes: &mut [OutlineTreeNode]) -> usize {
