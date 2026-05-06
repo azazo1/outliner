@@ -122,7 +122,6 @@ pub fn clean_title(input: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .trim_matches('.')
         .trim()
         .to_string()
 }
@@ -156,7 +155,9 @@ fn is_roman_numeral(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{TocCandidateEntry, normalize_toc_entries, parse_page_label, sanitize_title};
+    use super::{
+        TocCandidateEntry, clean_title, normalize_toc_entries, parse_page_label, sanitize_title,
+    };
 
     #[test]
     fn normalize_keeps_hierarchy_contiguous() {
@@ -181,6 +182,11 @@ mod tests {
     #[test]
     fn normalize_title_drops_fillers() {
         assert_eq!(sanitize_title("Chapter 1 .... 3"), "chapter13");
+    }
+
+    #[test]
+    fn clean_title_preserves_numbering_prefix() {
+        assert_eq!(clean_title(" 六.   提交要求 "), "六. 提交要求");
     }
 
     #[test]

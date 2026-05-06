@@ -18,7 +18,7 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 use crate::{
     config::{AppArgs, CliArgs, resolve_args},
     llm::{LlmConfig, extract_toc},
-    model::{RunOutcome, normalize_outline_for_compare, normalize_toc_entries},
+    model::{OutlineEntry, RunOutcome, normalize_outline_for_compare, normalize_toc_entries},
     pdf_support::PdfWorkspace,
     progress::{
         finish_stage, init_tracing, mark_complete, set_bar_message, start_bar, start_run_progress,
@@ -160,6 +160,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         },
     )?;
     drop(calibrate_span);
+    let calibrated = ensure_toc_heading_entry(&candidate_pages, calibrated);
     finish_stage(&run_span, "outline entries calibrated");
 
     let compare_span = start_spinner("compare_outline", "reading existing outline and comparing");
@@ -242,4 +243,92 @@ fn temporary_output_path(input: &Path) -> PathBuf {
 
 fn same_path(left: &Path, right: &Path) -> bool {
     left == right
+}
+
+fn ensure_toc_heading_entry(
+    candidate_pages: &[crate::model::CandidatePage],
+    mut entries: Vec<OutlineEntry>,
+) -> Vec<OutlineEntry> {
+    let Some(toc_page) = candidate_pages.iter().min_by_key(|page| page.physical_page) else {
+        return entries;
+    };
+
+    if entries.iter().any(|entry| {
+        is_toc_heading_title(&entry.title) && entry.physical_page == toc_page.physical_page
+    }) {
+        return entries;
+    }
+
+    let insert_at = entries
+        .iter()
+        .position(|entry| entry.physical_page >= toc_page.physical_page)
+        .unwrap_or(entries.len());
+    entries.insert(
+        insert_at,
+        OutlineEntry {
+            title: "目录".to_string(),
+            level: 1,
+            physical_page: toc_page.physical_page,
+            printed_page_label: None,
+        },
+    );
+    entries
+}
+
+fn is_toc_heading_title(title: &str) -> bool {
+    matches!(
+        crate::model::sanitize_title(title).as_str(),
+        "目录" | "contents" | "tableofcontents"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_toc_heading_entry, is_toc_heading_title};
+    use crate::model::{CandidatePage, OutlineEntry};
+
+    #[test]
+    fn inserts_missing_toc_heading_before_first_entry_on_same_or_later_page() {
+        let entries = ensure_toc_heading_entry(
+            &[CandidatePage {
+                physical_page: 5,
+                toc_score: 9,
+            }],
+            vec![OutlineEntry {
+                title: "第一章".to_string(),
+                level: 1,
+                physical_page: 6,
+                printed_page_label: None,
+            }],
+        );
+
+        assert_eq!(entries[0].title, "目录");
+        assert_eq!(entries[0].physical_page, 5);
+        assert_eq!(entries[1].title, "第一章");
+    }
+
+    #[test]
+    fn does_not_duplicate_existing_toc_heading_on_same_page() {
+        let entries = ensure_toc_heading_entry(
+            &[CandidatePage {
+                physical_page: 3,
+                toc_score: 8,
+            }],
+            vec![OutlineEntry {
+                title: "Table of Contents".to_string(),
+                level: 1,
+                physical_page: 3,
+                printed_page_label: None,
+            }],
+        );
+
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn recognizes_common_toc_titles() {
+        assert!(is_toc_heading_title("目录"));
+        assert!(is_toc_heading_title("Contents"));
+        assert!(is_toc_heading_title("Table of Contents"));
+    }
 }

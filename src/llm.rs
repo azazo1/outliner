@@ -17,7 +17,10 @@ Rules:
 - Only extract entries that are explicitly present in the table of contents pages.
 - Preserve hierarchy using level. Top-level entries must use level = 1.
 - Output entries in reading order.
+- Copy each title exactly as printed in the table of contents.
+- Preserve numbering, prefixes, bullets, and punctuation that belong to the title, such as `六.`, `Chapter 3`, or `Appendix A`.
 - Copy page labels exactly as printed when possible. They may be arabic numbers or roman numerals.
+- Do not paraphrase, translate, shorten, normalize, or drop any part of a title.
 - Do not invent missing titles, levels, or page labels.
 - Ignore running headers, footers, and body text that is not part of the table of contents.
 "#;
