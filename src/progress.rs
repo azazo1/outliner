@@ -10,6 +10,7 @@ use tracing::Span;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use tracing_indicatif::style::ProgressStyle;
 use tracing_indicatif::{IndicatifLayer, writer::get_indicatif_stdout_writer};
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
@@ -32,11 +33,14 @@ pub fn init_tracing() {
             ProgressStyle::with_template("{span_child_prefix}{spinner:.green} {wide_msg}")
                 .expect("default indicatif template"),
         );
+        let indicatif_writer = indicatif_layer.get_stderr_writer();
         let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_writer(indicatif_layer.get_stderr_writer())
+            .with_writer(indicatif_writer)
             .with_target(false)
             .without_time()
             .with_filter(default_env_filter());
+        let indicatif_layer =
+            indicatif_layer.with_filter(filter_fn(|metadata| matches!(metadata.name(), "outline" | "stage")));
 
         tracing_subscriber::registry()
             .with(fmt_layer)

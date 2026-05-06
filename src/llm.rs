@@ -18,7 +18,7 @@ use crate::model::{RenderedPage, TocExtraction};
 use crate::progress::set_spinner_message;
 
 const OUTPUT_WINDOW_LEN: usize = 44;
-const MAX_SCROLL_CHARS_PER_SECOND: f64 = 18.0;
+const MAX_SCROLL_CHARS_PER_SECOND: f64 = 180.0;
 
 const EXTRACTION_PREAMBLE: &str = r#"
 You extract a PDF table of contents into a flat outline sequence.
