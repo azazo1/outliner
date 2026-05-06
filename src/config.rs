@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde::Deserialize;
 
+const DEFAULT_CONFIG_PATH: &str = "~/.config/outliner/config.toml";
 const DEFAULT_FRONT_PAGES: usize = 20;
 const DEFAULT_MAX_TOC_PAGES: usize = 6;
 const DEFAULT_ANCHOR_WINDOW: usize = 3;
@@ -84,12 +85,7 @@ fn resolve_config_source(path: Option<&Path>) -> Result<Option<ConfigSource>> {
 }
 
 fn default_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("outliner")
-            .join("config.toml")
-    })
+    expand_path(Path::new(DEFAULT_CONFIG_PATH)).ok()
 }
 
 fn load_file_config(source: Option<ConfigSource>) -> Result<FileConfig> {
