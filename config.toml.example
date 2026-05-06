@@ -1,0 +1,7 @@
+model = "gpt-4o-mini"
+api_base = "https://api.openai.com/v1"
+api_key = "sk-..."
+front_pages = 20
+max_toc_pages = 6
+anchor_window = 3
+anchor_budget = 40
