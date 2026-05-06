@@ -16,7 +16,6 @@ use tracing_subscriber::{EnvFilter, Layer};
 static TRACING_INIT: Once = Once::new();
 
 const DEFAULT_LOG_FILTER: &str = "info";
-const STAGE_COUNT: u64 = 9;
 const MAX_PROGRESS_MESSAGE_LEN: usize = 72;
 const MAX_PROGRESS_PATH_LEN: usize = 48;
 
@@ -41,7 +40,7 @@ pub fn init_tracing() {
     });
 }
 
-pub fn start_run_progress(input: &std::path::Path) -> Span {
+pub fn start_run_progress(input: &std::path::Path, stage_count: u64) -> Span {
     let span = tracing::info_span!("outline", file = %input.display());
     span.pb_set_style(
         &ProgressStyle::with_template(
@@ -50,7 +49,7 @@ pub fn start_run_progress(input: &std::path::Path) -> Span {
         .expect("run progress template")
         .progress_chars("=> "),
     );
-    span.pb_set_length(STAGE_COUNT);
+    span.pb_set_length(stage_count);
     span.pb_set_position(0);
     set_bar_message(&span, display_path(input, MAX_PROGRESS_PATH_LEN));
     span.pb_start();
@@ -92,8 +91,8 @@ pub fn finish_stage(run_span: &Span, stage_name: &str) {
     set_bar_message(run_span, stage_name);
 }
 
-pub fn mark_complete(run_span: &Span, message: &str) {
-    run_span.pb_set_position(STAGE_COUNT);
+pub fn mark_complete(run_span: &Span, stage_count: u64, message: &str) {
+    run_span.pb_set_position(stage_count);
     set_bar_message(run_span, message);
 }
 

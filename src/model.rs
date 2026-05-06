@@ -3,21 +3,60 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
-pub struct CandidatePage {
-    pub physical_page: usize,
-    pub toc_score: usize,
-}
-
-#[derive(Debug, Clone)]
 pub struct RenderedPage {
     pub physical_page: usize,
     pub png_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl PageRange {
+    pub fn new(start: usize, end: usize) -> Option<Self> {
+        (start > 0 && start <= end).then_some(Self { start, end })
+    }
+
+    pub fn len(&self) -> usize {
+        self.end - self.start + 1
+    }
+
+    pub fn pages(&self) -> Vec<usize> {
+        (self.start..=self.end).collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageRangeSpec {
+    pub start: Option<usize>,
+    pub end: Option<usize>,
+}
+
+impl PageRangeSpec {
+    pub fn is_fully_bounded(&self) -> bool {
+        self.start.is_some() && self.end.is_some()
+    }
+
+    pub fn resolve(self, page_count: usize) -> Option<PageRange> {
+        if page_count == 0 {
+            return None;
+        }
+        let start = self.start.unwrap_or(1).clamp(1, page_count);
+        let end = self.end.unwrap_or(page_count).clamp(1, page_count);
+        PageRange::new(start, end)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TocExtraction {
     #[schemars(required)]
     pub toc_found: bool,
+    #[schemars(required)]
+    pub toc_start_page: Option<usize>,
+    #[schemars(required)]
+    pub toc_end_page: Option<usize>,
     #[schemars(required)]
     pub entries: Vec<TocCandidateEntry>,
     #[schemars(required)]
@@ -39,7 +78,6 @@ pub struct OutlineEntry {
     pub title: String,
     pub level: usize,
     pub physical_page: usize,
-    pub printed_page_label: Option<PageLabel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +87,7 @@ pub struct ExistingOutlineEntry {
     pub physical_page: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PageLabel {
     Arabic(usize),
     Roman(String),
@@ -148,15 +186,52 @@ pub fn parse_page_label(label: &str) -> Option<PageLabel> {
     None
 }
 
+impl PageLabel {
+    pub fn numeric_value(&self) -> Option<usize> {
+        match self {
+            Self::Arabic(number) => Some(*number),
+            Self::Roman(value) => roman_to_number(value),
+        }
+    }
+}
+
 fn is_roman_numeral(value: &str) -> bool {
     let re = Regex::new(r"(?i)^[ivxlcdm]+$").expect("roman numeral regex");
     re.is_match(value)
 }
 
+fn roman_to_number(value: &str) -> Option<usize> {
+    let mut total = 0usize;
+    let mut previous = 0usize;
+
+    for ch in value.chars().rev() {
+        let current = match ch.to_ascii_lowercase() {
+            'i' => 1,
+            'v' => 5,
+            'x' => 10,
+            'l' => 50,
+            'c' => 100,
+            'd' => 500,
+            'm' => 1000,
+            _ => return None,
+        };
+
+        if current < previous {
+            total = total.checked_sub(current)?;
+        } else {
+            total = total.checked_add(current)?;
+            previous = current;
+        }
+    }
+
+    Some(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        TocCandidateEntry, clean_title, normalize_toc_entries, parse_page_label, sanitize_title,
+        PageLabel, PageRange, PageRangeSpec, TocCandidateEntry, clean_title,
+        normalize_toc_entries, parse_page_label, sanitize_title,
     };
 
     #[test]
@@ -194,6 +269,31 @@ mod tests {
         assert_eq!(
             parse_page_label("XIV").expect("roman label").to_string(),
             "xiv"
+        );
+    }
+
+    #[test]
+    fn roman_page_label_exposes_numeric_value() {
+        assert_eq!(
+            PageLabel::Roman("xiv".to_string()).numeric_value(),
+            Some(14)
+        );
+    }
+
+    #[test]
+    fn page_range_len_is_inclusive() {
+        assert_eq!(PageRange::new(3, 5).expect("valid range").len(), 3);
+    }
+
+    #[test]
+    fn page_range_spec_resolves_open_bounds() {
+        assert_eq!(
+            PageRangeSpec {
+                start: None,
+                end: Some(4)
+            }
+            .resolve(20),
+            Some(PageRange { start: 1, end: 4 })
         );
     }
 

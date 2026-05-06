@@ -13,8 +13,9 @@ You extract a PDF table of contents into a flat outline sequence.
 
 Rules:
 - Decide whether the provided pages contain a real table of contents.
-- If there is no real table of contents, return toc_found = false and entries = [].
+- If there is no real table of contents, return toc_found = false, toc_start_page = null, toc_end_page = null, and entries = [].
 - Only extract entries that are explicitly present in the table of contents pages.
+- Set toc_start_page and toc_end_page to the earliest and latest physical pages among the provided images that actually belong to the table of contents.
 - Preserve hierarchy using level. Top-level entries must use level = 1.
 - Output entries in reading order.
 - Copy each title exactly as printed in the table of contents.
@@ -25,11 +26,46 @@ Rules:
 - Ignore running headers, footers, and body text that is not part of the table of contents.
 "#;
 
+const TOC_DISCOVERY_PREAMBLE: &str = r#"
+You inspect sampled PDF page images and decide which pages are part of a real table of contents.
+
+Rules:
+- Evaluate each page independently, then summarize the batch.
+- looks_like_toc = true only when the page itself is a table-of-contents page, or a standalone TOC heading page that directly belongs to adjacent TOC listing pages.
+- Body pages, chapter openers, references, indexes, blank separators, and running headers are not TOC pages.
+- confidence uses 0 to 3:
+  - 0 = definitely not TOC
+  - 1 = weak signal
+  - 2 = likely TOC
+  - 3 = strong TOC evidence
+- Always return one assessment per input page.
+"#;
+
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
     pub model: Option<String>,
     pub api_base: Option<String>,
     pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TocPageAssessment {
+    #[schemars(required)]
+    pub physical_page: usize,
+    #[schemars(required)]
+    pub looks_like_toc: bool,
+    #[schemars(required)]
+    pub confidence: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TocPageAssessmentBatch {
+    #[schemars(required)]
+    pub toc_found: bool,
+    #[schemars(required)]
+    pub notes: Option<String>,
+    #[schemars(required)]
+    pub assessments: Vec<TocPageAssessment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -44,6 +80,28 @@ pub struct VisionPageObservation {
 struct VisionPageObservationBatch {
     #[schemars(required)]
     observations: Vec<VisionPageObservation>,
+}
+
+pub async fn identify_toc_pages(
+    config: &LlmConfig,
+    pages: &[RenderedPage],
+) -> Result<TocPageAssessmentBatch> {
+    if pages.is_empty() {
+        bail!("no sampled pages were provided to the TOC locator");
+    }
+
+    let client = build_openai_client(config)?.completions_api();
+    let model = config.model.as_deref().unwrap_or(openai::GPT_4O_MINI);
+    let extractor = client
+        .extractor::<TocPageAssessmentBatch>(model)
+        .preamble(TOC_DISCOVERY_PREAMBLE)
+        .build();
+    let prompt = build_multimodal_message(
+        pages,
+        "Decide which of these sampled PDF pages are part of the real table of contents.",
+    )?;
+
+    extractor.extract(prompt).await.map_err(anyhow::Error::new)
 }
 
 pub async fn extract_toc(config: &LlmConfig, pages: &[RenderedPage]) -> Result<TocExtraction> {

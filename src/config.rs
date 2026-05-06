@@ -7,10 +7,9 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde::Deserialize;
 
+use crate::model::PageRangeSpec;
+
 const DEFAULT_CONFIG_PATH: &str = "~/.config/outliner/config.toml";
-const DEFAULT_MAX_TOC_PAGES: usize = 6;
-const DEFAULT_ANCHOR_WINDOW: usize = 3;
-const DEFAULT_ANCHOR_BUDGET: usize = 40;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -28,11 +27,7 @@ pub struct CliArgs {
     )]
     pub config: Option<PathBuf>,
     #[arg(long)]
-    pub max_toc_pages: Option<usize>,
-    #[arg(long)]
-    pub anchor_window: Option<usize>,
-    #[arg(long)]
-    pub anchor_budget: Option<usize>,
+    pub toc: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,9 +37,7 @@ pub struct AppArgs {
     pub model: Option<String>,
     pub api_base: Option<String>,
     pub api_key: Option<String>,
-    pub max_toc_pages: usize,
-    pub anchor_window: usize,
-    pub anchor_budget: usize,
+    pub toc: Option<PageRangeSpec>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -53,9 +46,6 @@ struct FileConfig {
     model: Option<String>,
     api_base: Option<String>,
     api_key: Option<String>,
-    max_toc_pages: Option<usize>,
-    anchor_window: Option<usize>,
-    anchor_budget: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,17 +101,12 @@ fn merge_args(cli: CliArgs, file: FileConfig) -> Result<AppArgs> {
         output,
         model,
         config: _,
-        max_toc_pages,
-        anchor_window,
-        anchor_budget,
+        toc,
     } = cli;
     let FileConfig {
         model: file_model,
         api_base,
         api_key,
-        max_toc_pages: file_max_toc_pages,
-        anchor_window: file_anchor_window,
-        anchor_budget: file_anchor_budget,
     } = file;
 
     Ok(AppArgs {
@@ -130,15 +115,9 @@ fn merge_args(cli: CliArgs, file: FileConfig) -> Result<AppArgs> {
         model: normalize_optional_string(model.or(file_model)),
         api_base: normalize_optional_string(api_base),
         api_key: normalize_optional_string(api_key),
-        max_toc_pages: max_toc_pages
-            .or(file_max_toc_pages)
-            .unwrap_or(DEFAULT_MAX_TOC_PAGES),
-        anchor_window: anchor_window
-            .or(file_anchor_window)
-            .unwrap_or(DEFAULT_ANCHOR_WINDOW),
-        anchor_budget: anchor_budget
-            .or(file_anchor_budget)
-            .unwrap_or(DEFAULT_ANCHOR_BUDGET),
+        toc: toc
+            .map(|value| parse_toc_range(&value))
+            .transpose()?,
     })
 }
 
@@ -155,32 +134,61 @@ fn expand_path(path: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(expanded.into_owned()))
 }
 
+fn parse_toc_range(input: &str) -> Result<PageRangeSpec> {
+    let trimmed = input.trim();
+    let Some((left, right)) = trimmed.split_once("..") else {
+        bail!("invalid --toc range `{trimmed}`, expected a..b, a.., or ..b");
+    };
+
+    let start = if left.trim().is_empty() {
+        None
+    } else {
+        Some(parse_positive_page(left.trim(), trimmed)?)
+    };
+    let end = if right.trim().is_empty() {
+        None
+    } else {
+        Some(parse_positive_page(right.trim(), trimmed)?)
+    };
+
+    if let (Some(start), Some(end)) = (start, end)
+        && start > end
+    {
+        bail!("invalid --toc range: start page must be <= end page");
+    }
+
+    Ok(PageRangeSpec { start, end })
+}
+
+fn parse_positive_page(value: &str, raw: &str) -> Result<usize> {
+    let page = value
+        .parse::<usize>()
+        .with_context(|| format!("invalid page number `{value}` in --toc `{raw}`"))?;
+    if page == 0 {
+        bail!("page numbers in --toc must be >= 1");
+    }
+    Ok(page)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{
-        AppArgs, CliArgs, DEFAULT_ANCHOR_BUDGET, DEFAULT_ANCHOR_WINDOW, DEFAULT_MAX_TOC_PAGES,
-        FileConfig, expand_path, merge_args,
-    };
+    use super::{AppArgs, CliArgs, FileConfig, expand_path, merge_args, parse_toc_range};
+    use crate::model::PageRangeSpec;
     use std::path::{Path, PathBuf};
 
     #[test]
-    fn cli_overrides_file_and_file_overrides_defaults() {
+    fn cli_overrides_file_values() {
         let cli = CliArgs {
             input: PathBuf::from("cli.pdf"),
             output: Some(PathBuf::from("cli-out.pdf")),
             model: Some("gpt-4.1-mini".to_string()),
             config: None,
-            max_toc_pages: None,
-            anchor_window: None,
-            anchor_budget: Some(25),
+            toc: Some("4..9".to_string()),
         };
         let file = FileConfig {
             model: Some("gpt-4o-mini".to_string()),
             api_base: Some("https://example.com/v1".to_string()),
             api_key: Some("file-key".to_string()),
-            max_toc_pages: Some(5),
-            anchor_window: Some(4),
-            anchor_budget: Some(17),
         };
 
         let resolved = merge_args(cli, file).expect("args should resolve");
@@ -193,26 +201,25 @@ mod tests {
                 model: Some("gpt-4.1-mini".to_string()),
                 api_base: Some("https://example.com/v1".to_string()),
                 api_key: Some("file-key".to_string()),
-                max_toc_pages: 5,
-                anchor_window: 4,
-                anchor_budget: 25,
+                toc: Some(PageRangeSpec {
+                    start: Some(4),
+                    end: Some(9)
+                }),
             }
         );
     }
 
     #[test]
-    fn defaults_are_used_when_file_and_cli_are_missing() {
+    fn toc_defaults_to_none() {
         let cli = CliArgs {
             input: PathBuf::from("book.pdf"),
             output: None,
             model: None,
             config: None,
-            max_toc_pages: None,
-            anchor_window: None,
-            anchor_budget: None,
+            toc: None,
         };
 
-        let resolved = merge_args(cli, FileConfig::default()).expect("defaults should resolve");
+        let resolved = merge_args(cli, FileConfig::default()).expect("args should resolve");
 
         assert_eq!(
             resolved,
@@ -222,9 +229,7 @@ mod tests {
                 model: None,
                 api_base: None,
                 api_key: None,
-                max_toc_pages: DEFAULT_MAX_TOC_PAGES,
-                anchor_window: DEFAULT_ANCHOR_WINDOW,
-                anchor_budget: DEFAULT_ANCHOR_BUDGET,
+                toc: None,
             }
         );
     }
@@ -252,6 +257,24 @@ mod tests {
 
         assert_eq!(file.api_base.as_deref(), Some("https://example.com/v1"));
         assert_eq!(file.api_key.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn toc_range_supports_open_ended_syntax() {
+        assert_eq!(
+            parse_toc_range("3..").expect("open-ended start"),
+            PageRangeSpec {
+                start: Some(3),
+                end: None
+            }
+        );
+        assert_eq!(
+            parse_toc_range("..7").expect("open-ended end"),
+            PageRangeSpec {
+                start: None,
+                end: Some(7)
+            }
+        );
     }
 
     #[test]

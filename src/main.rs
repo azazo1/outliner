@@ -17,7 +17,7 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::{
     config::{AppArgs, CliArgs, resolve_args},
-    llm::{LlmConfig, extract_toc},
+    llm::{LlmConfig, extract_toc, identify_toc_pages, observe_page_labels},
     model::{OutlineEntry, RunOutcome, normalize_outline_for_compare, normalize_toc_entries},
     pdf_support::PdfWorkspace,
     progress::{
@@ -57,7 +57,8 @@ async fn main() -> Result<()> {
 }
 
 async fn run(args: AppArgs) -> Result<RunOutcome> {
-    let run_span = start_run_progress(&args.input);
+    let stage_count = stage_count_for(&args);
+    let run_span = start_run_progress(&args.input, stage_count);
     let _run_guard = run_span.enter();
 
     let open_span = start_spinner("open_pdf", "opening pdf and reading page count");
@@ -68,65 +69,83 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     drop(open_span);
     finish_stage(&run_span, "pdf opened");
 
-    let workspace_span = start_spinner(
-        "workspace",
-        format!("extracting text from {page_count} pages"),
-    );
-    let workspace = PdfWorkspace::new(args.input.clone(), page_count)?;
+    let workspace_span = start_spinner("workspace", "preparing image-only pdf workspace");
+    let workspace = PdfWorkspace::new(args.input.clone(), page_count);
     drop(workspace_span);
-    finish_stage(&run_span, "text extracted");
-
-    let candidate_span = start_spinner(
-        "candidate_toc_pages",
-        format!("searching across {} pages for toc candidates", page_count),
-    );
-    let candidate_pages = workspace.candidate_toc_pages(args.max_toc_pages)?;
-    drop(candidate_span);
-    finish_stage(&run_span, "candidate pages selected");
-
-    let candidate_page_numbers = candidate_pages
-        .iter()
-        .map(|page| page.physical_page)
-        .collect::<Vec<_>>();
-    let render_span = start_bar(
-        "render_pages",
-        candidate_page_numbers.len() as u64,
-        format!("rendering {} candidate pages", candidate_page_numbers.len()),
-    );
-    let rendered_pages = workspace.render_pages_with_progress(
-        &candidate_page_numbers,
-        |completed, physical_page| {
-            render_span.pb_set_position(completed as u64);
-            set_bar_message(
-                &render_span,
-                format!(
-                    "page {physical_page} ({completed}/{})",
-                    candidate_page_numbers.len()
-                ),
-            );
-        },
-    )?;
-    drop(render_span);
-    finish_stage(&run_span, "candidate pages rendered");
+    finish_stage(&run_span, "workspace ready");
 
     let llm_config = LlmConfig {
         model: args.model.clone(),
         api_base: args.api_base.clone(),
         api_key: args.api_key.clone(),
     };
-    let extract_span = start_spinner(
-        "extract_toc",
-        "extracting table of contents with vision model",
+
+    let refined_toc_range = if args.toc.is_some_and(|spec| spec.is_fully_bounded()) {
+        workspace.resolve_toc_range(args.toc)
+    } else {
+        let discovery_pages = workspace.discover_toc_sample_pages(args.toc);
+        let discovery_render_span = start_bar(
+            "render_toc_samples",
+            discovery_pages.len() as u64,
+            format!("rendering {} toc discovery samples", discovery_pages.len()),
+        );
+        let discovery_rendered =
+            workspace.render_pages_with_progress(&discovery_pages, |completed, physical_page| {
+                discovery_render_span.pb_set_position(completed as u64);
+                set_bar_message(
+                    &discovery_render_span,
+                    format!(
+                        "page {physical_page} ({completed}/{})",
+                        discovery_pages.len()
+                    ),
+                );
+            })?;
+        drop(discovery_render_span);
+        finish_stage(&run_span, "toc discovery samples rendered");
+
+        let discovery_span = start_spinner("locate_toc", "locating toc pages with vision model");
+        let toc_page_batch = identify_toc_pages(&llm_config, &discovery_rendered)
+            .instrument(discovery_span.clone())
+            .await?;
+        drop(discovery_span);
+        finish_stage(&run_span, "toc pages located");
+        workspace.refine_toc_range(args.toc, &toc_page_batch)
+    };
+    let toc_pages = workspace.toc_pages_to_render(args.toc, refined_toc_range);
+    if toc_pages.is_empty() {
+        mark_complete(&run_span, stage_count, "stopped: no reliable table of contents");
+        return Ok(RunOutcome::NoTocFound {
+            reason: "the PDF does not contain a reliable table of contents".to_string(),
+        });
+    }
+
+    let toc_render_span = start_bar(
+        "render_toc_pages",
+        toc_pages.len() as u64,
+        format!("rendering {} toc pages", toc_pages.len()),
     );
-    let extracted = extract_toc(&llm_config, &rendered_pages)
+    let rendered_toc_pages =
+        workspace.render_pages_with_progress(&toc_pages, |completed, physical_page| {
+            toc_render_span.pb_set_position(completed as u64);
+            set_bar_message(
+                &toc_render_span,
+                format!("page {physical_page} ({completed}/{})", toc_pages.len()),
+            );
+        })?;
+    drop(toc_render_span);
+    finish_stage(&run_span, "toc pages rendered");
+
+    let extract_span = start_spinner("extract_toc", "extracting table of contents with vision model");
+    let extracted = extract_toc(&llm_config, &rendered_toc_pages)
         .instrument(extract_span.clone())
         .await?;
     drop(extract_span);
     finish_stage(&run_span, "table of contents extracted");
+    let toc_heading_page = workspace.toc_heading_page(&extracted);
     let toc_entries = normalize_toc_entries(extracted.entries);
 
     if !extracted.toc_found || toc_entries.len() < 2 {
-        mark_complete(&run_span, "stopped: no reliable table of contents");
+        mark_complete(&run_span, stage_count, "stopped: no reliable table of contents");
         return Ok(RunOutcome::NoTocFound {
             reason: extracted.notes.unwrap_or_else(|| {
                 "the PDF does not contain a reliable table of contents".to_string()
@@ -134,34 +153,35 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         });
     }
 
-    let observe_span = start_spinner("observe_page_labels", "observing printed page labels");
-    let observations = llm::observe_page_labels(&llm_config, &rendered_pages)
+    let label_pages = workspace.label_sample_pages(&toc_pages, &toc_entries);
+    let label_render_span = start_bar(
+        "render_label_samples",
+        label_pages.len() as u64,
+        format!("rendering {} page-label samples", label_pages.len()),
+    );
+    let rendered_label_pages =
+        workspace.render_pages_with_progress(&label_pages, |completed, physical_page| {
+            label_render_span.pb_set_position(completed as u64);
+            set_bar_message(
+                &label_render_span,
+                format!("page {physical_page} ({completed}/{})", label_pages.len()),
+            );
+        })?;
+    drop(label_render_span);
+    finish_stage(&run_span, "page-label samples rendered");
+
+    let observe_span = start_spinner("observe_page_labels", "observing visible page labels");
+    let observations = observe_page_labels(&llm_config, &rendered_label_pages)
         .instrument(observe_span.clone())
         .await?;
     drop(observe_span);
     finish_stage(&run_span, "page labels observed");
 
-    let calibrate_span = start_bar(
-        "calibrate_entries",
-        toc_entries.len() as u64,
-        format!("calibrating {} outline entries", toc_entries.len()),
-    );
-    let calibrated = workspace.calibrate_entries_with_progress(
-        &toc_entries,
-        &observations,
-        args.anchor_window,
-        args.anchor_budget,
-        |completed, title| {
-            calibrate_span.pb_set_position(completed as u64);
-            set_bar_message(
-                &calibrate_span,
-                format!("entry {completed}/{}: {title}", toc_entries.len()),
-            );
-        },
-    )?;
+    let calibrate_span = start_spinner("resolve_entries", "mapping toc page labels to physical pages");
+    let calibrated = workspace.calibrate_entries_from_observations(&toc_entries, &observations);
+    let calibrated = ensure_toc_heading_entry(toc_heading_page, calibrated);
     drop(calibrate_span);
-    let calibrated = ensure_toc_heading_entry(&candidate_pages, calibrated);
-    finish_stage(&run_span, "outline entries calibrated");
+    finish_stage(&run_span, "outline entries resolved");
 
     let compare_span = start_spinner("compare_outline", "reading existing outline and comparing");
     let existing_outline = read_existing_outline(&pdf)?;
@@ -179,7 +199,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
 
     if !normalized_existing.is_empty() && normalized_existing == normalized_target {
         finish_stage(&run_span, "existing outline already aligned");
-        mark_complete(&run_span, "stopped: outline already aligned");
+        mark_complete(&run_span, stage_count, "stopped: outline already aligned");
         return Ok(RunOutcome::AlreadyAligned {
             entries: calibrated.len(),
         });
@@ -202,7 +222,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         })?;
         drop(write_span);
         finish_stage(&run_span, "outline written");
-        mark_complete(&run_span, "completed");
+        mark_complete(&run_span, stage_count, "completed");
         Ok(RunOutcome::Updated {
             output_path: args.input,
             entries: calibrated.len(),
@@ -211,7 +231,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         write_outline(&pdf, &calibrated, &output_path)?;
         drop(write_span);
         finish_stage(&run_span, "outline written");
-        mark_complete(&run_span, "completed");
+        mark_complete(&run_span, stage_count, "completed");
         Ok(RunOutcome::Updated {
             output_path,
             entries: calibrated.len(),
@@ -245,31 +265,39 @@ fn same_path(left: &Path, right: &Path) -> bool {
     left == right
 }
 
+fn stage_count_for(args: &AppArgs) -> u64 {
+    if args.toc.is_some_and(|spec| spec.is_fully_bounded()) {
+        8
+    } else {
+        10
+    }
+}
+
 fn ensure_toc_heading_entry(
-    candidate_pages: &[crate::model::CandidatePage],
+    toc_heading_page: Option<usize>,
     mut entries: Vec<OutlineEntry>,
 ) -> Vec<OutlineEntry> {
-    let Some(toc_page) = candidate_pages.iter().min_by_key(|page| page.physical_page) else {
+    let Some(toc_page) = toc_heading_page else {
         return entries;
     };
 
-    if entries.iter().any(|entry| {
-        is_toc_heading_title(&entry.title) && entry.physical_page == toc_page.physical_page
-    }) {
+    if entries
+        .iter()
+        .any(|entry| is_toc_heading_title(&entry.title) && entry.physical_page == toc_page)
+    {
         return entries;
     }
 
     let insert_at = entries
         .iter()
-        .position(|entry| entry.physical_page >= toc_page.physical_page)
+        .position(|entry| entry.physical_page >= toc_page)
         .unwrap_or(entries.len());
     entries.insert(
         insert_at,
         OutlineEntry {
             title: "目录".to_string(),
             level: 1,
-            physical_page: toc_page.physical_page,
-            printed_page_label: None,
+            physical_page: toc_page,
         },
     );
     entries
@@ -284,21 +312,18 @@ fn is_toc_heading_title(title: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_toc_heading_entry, is_toc_heading_title};
-    use crate::model::{CandidatePage, OutlineEntry};
+    use super::{ensure_toc_heading_entry, is_toc_heading_title, stage_count_for};
+    use crate::{config::AppArgs, model::{OutlineEntry, PageRangeSpec}};
+    use std::path::PathBuf;
 
     #[test]
     fn inserts_missing_toc_heading_before_first_entry_on_same_or_later_page() {
         let entries = ensure_toc_heading_entry(
-            &[CandidatePage {
-                physical_page: 5,
-                toc_score: 9,
-            }],
+            Some(5),
             vec![OutlineEntry {
                 title: "第一章".to_string(),
                 level: 1,
                 physical_page: 6,
-                printed_page_label: None,
             }],
         );
 
@@ -310,15 +335,11 @@ mod tests {
     #[test]
     fn does_not_duplicate_existing_toc_heading_on_same_page() {
         let entries = ensure_toc_heading_entry(
-            &[CandidatePage {
-                physical_page: 3,
-                toc_score: 8,
-            }],
+            Some(3),
             vec![OutlineEntry {
                 title: "Table of Contents".to_string(),
                 level: 1,
                 physical_page: 3,
-                printed_page_label: None,
             }],
         );
 
@@ -326,9 +347,36 @@ mod tests {
     }
 
     #[test]
+    fn keeps_entries_unchanged_when_toc_page_is_unknown() {
+        let entries = vec![OutlineEntry {
+            title: "第一章".to_string(),
+            level: 1,
+            physical_page: 6,
+        }];
+
+        assert_eq!(ensure_toc_heading_entry(None, entries.clone()), entries);
+    }
+
+    #[test]
     fn recognizes_common_toc_titles() {
         assert!(is_toc_heading_title("目录"));
         assert!(is_toc_heading_title("Contents"));
         assert!(is_toc_heading_title("Table of Contents"));
+    }
+
+    #[test]
+    fn stage_count_skips_discovery_when_toc_range_is_fully_bounded() {
+        let args = AppArgs {
+            input: PathBuf::from("book.pdf"),
+            output: None,
+            model: None,
+            api_base: None,
+            api_key: None,
+            toc: Some(PageRangeSpec {
+                start: Some(3),
+                end: Some(7),
+            }),
+        };
+        assert_eq!(stage_count_for(&args), 8);
     }
 }
