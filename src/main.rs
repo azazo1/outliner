@@ -144,9 +144,16 @@ async fn run(args: Args) -> Result<RunOutcome> {
 }
 
 fn determine_output_path(input: &Path, output: Option<&Path>) -> PathBuf {
-    output
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| input.to_path_buf())
+    output.map(Path::to_path_buf).unwrap_or_else(|| {
+        let (Some(stem), Some(ext)) = (input.file_stem(), input.extension()) else {
+            return input.to_path_buf();
+        };
+        input.with_file_name(format!(
+            "outlined_{}.{}",
+            stem.to_string_lossy(),
+            ext.to_string_lossy()
+        ))
+    })
 }
 
 fn temporary_output_path(input: &Path) -> PathBuf {
