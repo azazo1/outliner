@@ -89,7 +89,11 @@ impl PdfWorkspace {
         extracted_toc.toc_start_page
     }
 
-    pub fn label_sample_pages(&self, toc_pages: &[usize], entries: &[TocCandidateEntry]) -> Vec<usize> {
+    pub fn label_sample_pages(
+        &self,
+        toc_pages: &[usize],
+        entries: &[TocCandidateEntry],
+    ) -> Vec<usize> {
         let min_target = entries.iter().filter_map(entry_label_value).min();
         let max_target = entries.iter().filter_map(entry_label_value).max();
 
@@ -145,12 +149,8 @@ impl PdfWorkspace {
             .iter()
             .map(|entry| {
                 let page_label = crate::model::parse_page_label(&entry.page_label);
-                let physical_page = resolve_entry_page(
-                    page_label.as_ref(),
-                    offsets,
-                    &anchors,
-                    self.page_count,
-                );
+                let physical_page =
+                    resolve_entry_page(page_label.as_ref(), offsets, &anchors, self.page_count);
                 OutlineEntry {
                     title: entry.title.clone(),
                     level: usize::from(entry.level),
@@ -202,7 +202,9 @@ fn observation_map(observations: &[VisionPageObservation]) -> HashMap<PageLabel,
         else {
             continue;
         };
-        map.entry(label).or_default().push(observation.physical_page);
+        map.entry(label)
+            .or_default()
+            .push(observation.physical_page);
     }
     map
 }
@@ -261,7 +263,10 @@ fn resolve_entry_page(
 }
 
 fn best_offset(scores: HashMap<isize, usize>) -> Option<isize> {
-    scores.into_iter().max_by_key(|(_, score)| *score).map(|(offset, _)| offset)
+    scores
+        .into_iter()
+        .max_by_key(|(_, score)| *score)
+        .map(|(offset, _)| offset)
 }
 
 fn entry_label_value(entry: &TocCandidateEntry) -> Option<usize> {
@@ -325,7 +330,7 @@ mod tests {
     use super::{infer_best_offsets, sample_pages};
     use crate::{
         llm::VisionPageObservation,
-        model::{PageRange, PageLabel},
+        model::{PageLabel, PageRange},
     };
 
     #[test]

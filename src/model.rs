@@ -1,4 +1,5 @@
 use regex::Regex;
+use rig::completion::Usage;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -104,13 +105,19 @@ pub struct NormalizedOutlineEntry {
 pub enum RunOutcome {
     NoTocFound {
         reason: String,
+        usage: Usage,
+        agent_calls: u64,
     },
     AlreadyAligned {
         entries: usize,
+        usage: Usage,
+        agent_calls: u64,
     },
     Updated {
         output_path: std::path::PathBuf,
         entries: usize,
+        usage: Usage,
+        agent_calls: u64,
     },
 }
 
@@ -230,8 +237,8 @@ fn roman_to_number(value: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PageLabel, PageRange, PageRangeSpec, TocCandidateEntry, clean_title,
-        normalize_toc_entries, parse_page_label, sanitize_title,
+        PageLabel, PageRange, PageRangeSpec, TocCandidateEntry, clean_title, normalize_toc_entries,
+        parse_page_label, sanitize_title,
     };
 
     #[test]

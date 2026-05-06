@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use rig::OneOrMany;
+use rig::completion::Usage;
+use rig::extractor::ExtractionResponse;
 use rig::message::{Image, ImageDetail, ImageMediaType, Message, UserContent};
 use rig::providers::openai;
 use schemars::JsonSchema;
@@ -48,6 +50,12 @@ pub struct LlmConfig {
     pub api_key: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LlmCall<T> {
+    pub data: T,
+    pub usage: Usage,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TocPageAssessment {
     #[schemars(required)]
@@ -85,7 +93,7 @@ struct VisionPageObservationBatch {
 pub async fn identify_toc_pages(
     config: &LlmConfig,
     pages: &[RenderedPage],
-) -> Result<TocPageAssessmentBatch> {
+) -> Result<LlmCall<TocPageAssessmentBatch>> {
     if pages.is_empty() {
         bail!("no sampled pages were provided to the TOC locator");
     }
@@ -101,10 +109,20 @@ pub async fn identify_toc_pages(
         "Decide which of these sampled PDF pages are part of the real table of contents.",
     )?;
 
-    extractor.extract(prompt).await.map_err(anyhow::Error::new)
+    let response: ExtractionResponse<TocPageAssessmentBatch> = extractor
+        .extract_with_usage(prompt)
+        .await
+        .map_err(anyhow::Error::new)?;
+    Ok(LlmCall {
+        data: response.data,
+        usage: response.usage,
+    })
 }
 
-pub async fn extract_toc(config: &LlmConfig, pages: &[RenderedPage]) -> Result<TocExtraction> {
+pub async fn extract_toc(
+    config: &LlmConfig,
+    pages: &[RenderedPage],
+) -> Result<LlmCall<TocExtraction>> {
     if pages.is_empty() {
         bail!("no candidate pages were provided to the LLM extractor");
     }
@@ -120,15 +138,25 @@ pub async fn extract_toc(config: &LlmConfig, pages: &[RenderedPage]) -> Result<T
         "Determine whether these PDF pages contain a table of contents, then extract it.",
     )?;
 
-    extractor.extract(prompt).await.map_err(anyhow::Error::new)
+    let response: ExtractionResponse<TocExtraction> = extractor
+        .extract_with_usage(prompt)
+        .await
+        .map_err(anyhow::Error::new)?;
+    Ok(LlmCall {
+        data: response.data,
+        usage: response.usage,
+    })
 }
 
 pub async fn observe_page_labels(
     config: &LlmConfig,
     pages: &[RenderedPage],
-) -> Result<Vec<VisionPageObservation>> {
+) -> Result<LlmCall<Vec<VisionPageObservation>>> {
     if pages.is_empty() {
-        return Ok(Vec::new());
+        return Ok(LlmCall {
+            data: Vec::new(),
+            usage: Usage::new(),
+        });
     }
 
     let client = build_openai_client(config)?.completions_api();
@@ -143,8 +171,14 @@ pub async fn observe_page_labels(
         pages,
         "Return the observed printed page labels for these page images.",
     )?;
-    let batch = extractor.extract(prompt).await?;
-    Ok(batch.observations)
+    let response: ExtractionResponse<VisionPageObservationBatch> = extractor
+        .extract_with_usage(prompt)
+        .await
+        .map_err(anyhow::Error::new)?;
+    Ok(LlmCall {
+        data: response.data.observations,
+        usage: response.usage,
+    })
 }
 
 fn build_multimodal_message(pages: &[RenderedPage], instruction: &str) -> Result<Message> {

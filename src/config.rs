@@ -115,9 +115,7 @@ fn merge_args(cli: CliArgs, file: FileConfig) -> Result<AppArgs> {
         model: normalize_optional_string(model.or(file_model)),
         api_base: normalize_optional_string(api_base),
         api_key: normalize_optional_string(api_key),
-        toc: toc
-            .map(|value| parse_toc_range(&value))
-            .transpose()?,
+        toc: toc.map(|value| parse_toc_range(&value)).transpose()?,
     })
 }
 
