@@ -1174,6 +1174,7 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
+ "futures-util",
  "qpdf",
  "regex",
  "rig-core",

@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.100"
 base64 = "0.22.1"
 clap = { version = "4.6.1", features = ["derive"] }
+futures-util = "0.3.31"
 qpdf = "0.3.5"
 regex = "1.12.2"
 rig-core = "0.36.0"

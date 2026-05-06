@@ -1,14 +1,24 @@
 use anyhow::{Context, Result, bail};
 use base64::{Engine, prelude::BASE64_STANDARD};
+use futures_util::StreamExt;
 use rig::OneOrMany;
+use rig::agent::MultiTurnStreamItem;
+use rig::client::completion::CompletionClient;
 use rig::completion::Usage;
 use rig::extractor::ExtractionResponse;
 use rig::message::{Image, ImageDetail, ImageMediaType, Message, UserContent};
 use rig::providers::openai;
+use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
+use tracing::Span;
 
 use crate::model::{RenderedPage, TocExtraction};
+use crate::progress::set_spinner_message;
+
+const OUTPUT_WINDOW_LEN: usize = 44;
+const MAX_SCROLL_CHARS_PER_SECOND: f64 = 18.0;
 
 const EXTRACTION_PREAMBLE: &str = r#"
 You extract a PDF table of contents into a flat outline sequence.
@@ -93,64 +103,56 @@ struct VisionPageObservationBatch {
 pub async fn identify_toc_pages(
     config: &LlmConfig,
     pages: &[RenderedPage],
+    progress_span: Option<&Span>,
+    progress_label: &str,
 ) -> Result<LlmCall<TocPageAssessmentBatch>> {
     if pages.is_empty() {
         bail!("no sampled pages were provided to the TOC locator");
     }
 
-    let client = build_openai_client(config)?.completions_api();
-    let model = config.model.as_deref().unwrap_or(openai::GPT_4O_MINI);
-    let extractor = client
-        .extractor::<TocPageAssessmentBatch>(model)
-        .preamble(TOC_DISCOVERY_PREAMBLE)
-        .build();
     let prompt = build_multimodal_message(
         pages,
         "Decide which of these sampled PDF pages are part of the real table of contents.",
     )?;
-
-    let response: ExtractionResponse<TocPageAssessmentBatch> = extractor
-        .extract_with_usage(prompt)
-        .await
-        .map_err(anyhow::Error::new)?;
-    Ok(LlmCall {
-        data: response.data,
-        usage: response.usage,
-    })
+    stream_structured_output(
+        config,
+        TOC_DISCOVERY_PREAMBLE,
+        prompt,
+        progress_span,
+        progress_label,
+    )
+    .await
 }
 
 pub async fn extract_toc(
     config: &LlmConfig,
     pages: &[RenderedPage],
+    progress_span: Option<&Span>,
+    progress_label: &str,
 ) -> Result<LlmCall<TocExtraction>> {
     if pages.is_empty() {
         bail!("no candidate pages were provided to the LLM extractor");
     }
 
-    let client = build_openai_client(config)?.completions_api();
-    let model = config.model.as_deref().unwrap_or(openai::GPT_4O_MINI);
-    let extractor = client
-        .extractor::<TocExtraction>(model)
-        .preamble(EXTRACTION_PREAMBLE)
-        .build();
     let prompt = build_multimodal_message(
         pages,
         "Determine whether these PDF pages contain a table of contents, then extract it.",
     )?;
-
-    let response: ExtractionResponse<TocExtraction> = extractor
-        .extract_with_usage(prompt)
-        .await
-        .map_err(anyhow::Error::new)?;
-    Ok(LlmCall {
-        data: response.data,
-        usage: response.usage,
-    })
+    stream_structured_output(
+        config,
+        EXTRACTION_PREAMBLE,
+        prompt,
+        progress_span,
+        progress_label,
+    )
+    .await
 }
 
 pub async fn observe_page_labels(
     config: &LlmConfig,
     pages: &[RenderedPage],
+    progress_span: Option<&Span>,
+    progress_label: &str,
 ) -> Result<LlmCall<Vec<VisionPageObservation>>> {
     if pages.is_empty() {
         return Ok(LlmCall {
@@ -159,22 +161,18 @@ pub async fn observe_page_labels(
         });
     }
 
-    let client = build_openai_client(config)?.completions_api();
-    let model = config.model.as_deref().unwrap_or(openai::GPT_4O_MINI);
-    let extractor = client
-        .extractor::<VisionPageObservationBatch>(model)
-        .preamble(
-            "You inspect PDF page images. For each page image, detect the visible printed page label if one is clearly present in the page header or footer. Use the exact visible label, usually digits or roman numerals. If no printed page label is visible, use null. Always return one observation per input page image.",
-        )
-        .build();
     let prompt = build_multimodal_message(
         pages,
         "Return the observed printed page labels for these page images.",
     )?;
-    let response: ExtractionResponse<VisionPageObservationBatch> = extractor
-        .extract_with_usage(prompt)
-        .await
-        .map_err(anyhow::Error::new)?;
+    let response = stream_structured_output::<VisionPageObservationBatch>(
+        config,
+        "You inspect PDF page images. For each page image, detect the visible printed page label if one is clearly present in the page header or footer. Use the exact visible label, usually digits or roman numerals. If no printed page label is visible, use null. Always return one observation per input page image.",
+        prompt,
+        progress_span,
+        progress_label,
+    )
+    .await?;
     Ok(LlmCall {
         data: response.data.observations,
         usage: response.usage,
@@ -228,4 +226,183 @@ fn build_openai_client(config: &LlmConfig) -> Result<openai::Client> {
     builder
         .build()
         .context("failed to initialize OpenAI client")
+}
+
+async fn stream_structured_output<T>(
+    config: &LlmConfig,
+    preamble: &str,
+    prompt: Message,
+    progress_span: Option<&Span>,
+    progress_label: &str,
+) -> Result<LlmCall<T>>
+where
+    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
+{
+    let client = build_openai_client(config)?;
+    let model = config.model.as_deref().unwrap_or(openai::GPT_4O_MINI);
+    let agent = client
+        .agent(model)
+        .preamble(preamble)
+        .output_schema::<T>()
+        .build();
+    let mut stream = agent.stream_prompt(prompt).await;
+    let mut output_chars = 0usize;
+    let mut streamed_text = String::new();
+    let mut final_text = String::new();
+    let mut usage = Usage::new();
+    let mut output_window = OutputWindow::new(OUTPUT_WINDOW_LEN, MAX_SCROLL_CHARS_PER_SECOND);
+
+    update_stream_progress(
+        progress_span,
+        progress_label,
+        output_chars,
+        &output_window.render(),
+    );
+
+    while let Some(item) = stream.next().await {
+        match item.map_err(anyhow::Error::new)? {
+            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text)) => {
+                output_chars += text.text.chars().count();
+                streamed_text.push_str(&text.text);
+                output_window.push_str(&text.text);
+                update_stream_progress(
+                    progress_span,
+                    progress_label,
+                    output_chars,
+                    &output_window.render(),
+                );
+            }
+            MultiTurnStreamItem::FinalResponse(response) => {
+                final_text = response.response().to_string();
+                usage = response.usage();
+            }
+            _ => {}
+        }
+    }
+
+    if final_text.is_empty() {
+        final_text = streamed_text;
+    }
+
+    output_window.finish(&final_text);
+    update_stream_progress(
+        progress_span,
+        progress_label,
+        output_chars,
+        &output_window.render(),
+    );
+
+    let response: ExtractionResponse<T> = ExtractionResponse {
+        data: serde_json::from_str(&final_text)
+            .with_context(|| format!("failed to deserialize structured response: {final_text}"))?,
+        usage,
+    };
+
+    Ok(LlmCall {
+        data: response.data,
+        usage: response.usage,
+    })
+}
+
+fn update_stream_progress(
+    progress_span: Option<&Span>,
+    progress_label: &str,
+    output_chars: usize,
+    output_window: &str,
+) {
+    if let Some(progress_span) = progress_span {
+        set_spinner_message(
+            progress_span,
+            progress_label,
+            Some(output_chars),
+            Some(output_window),
+        );
+    }
+}
+
+struct OutputWindow {
+    full_text: String,
+    total_chars: usize,
+    visible_start_chars: usize,
+    window_len: usize,
+    max_scroll_chars_per_second: f64,
+    scroll_credit_chars: f64,
+    last_update: Instant,
+}
+
+impl OutputWindow {
+    fn new(window_len: usize, max_scroll_chars_per_second: f64) -> Self {
+        Self {
+            full_text: String::new(),
+            total_chars: 0,
+            visible_start_chars: 0,
+            window_len,
+            max_scroll_chars_per_second,
+            scroll_credit_chars: 0.0,
+            last_update: Instant::now(),
+        }
+    }
+
+    fn push_str(&mut self, text: &str) {
+        self.full_text.push_str(text);
+        self.total_chars += text.chars().count();
+        self.advance_visible_window();
+    }
+
+    fn finish(&mut self, final_text: &str) {
+        self.full_text.clear();
+        self.full_text.push_str(final_text);
+        self.total_chars = final_text.chars().count();
+        self.visible_start_chars = self.total_chars.saturating_sub(self.window_len);
+        self.scroll_credit_chars = 0.0;
+        self.last_update = Instant::now();
+    }
+
+    fn render(&self) -> String {
+        if self.total_chars == 0 {
+            return String::new();
+        }
+
+        let visible_end_chars = self
+            .visible_start_chars
+            .saturating_add(self.window_len)
+            .min(self.total_chars);
+        let window = slice_chars(&self.full_text, self.visible_start_chars, visible_end_chars);
+
+        match (
+            self.visible_start_chars > 0,
+            visible_end_chars < self.total_chars,
+        ) {
+            (true, true) => format!("...{window}..."),
+            (true, false) => format!("...{window}"),
+            (false, true) => format!("{window}..."),
+            (false, false) => window,
+        }
+    }
+
+    fn advance_visible_window(&mut self) {
+        if self.total_chars <= self.window_len {
+            self.visible_start_chars = 0;
+            self.last_update = Instant::now();
+            return;
+        }
+
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_update).as_secs_f64();
+        self.last_update = now;
+        self.scroll_credit_chars += elapsed * self.max_scroll_chars_per_second;
+
+        let desired_start = self.total_chars.saturating_sub(self.window_len);
+        let max_advance = self.scroll_credit_chars.floor() as usize;
+        let advance = max_advance.min(desired_start.saturating_sub(self.visible_start_chars));
+        self.visible_start_chars += advance;
+        self.scroll_credit_chars -= advance as f64;
+    }
+}
+
+fn slice_chars(text: &str, start: usize, end: usize) -> String {
+    text.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
 }

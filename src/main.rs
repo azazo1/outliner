@@ -22,8 +22,9 @@ use crate::{
     model::{OutlineEntry, RunOutcome, normalize_outline_for_compare, normalize_toc_entries},
     pdf_support::PdfWorkspace,
     progress::{
-        finish_stage, format_usage_details, init_tracing, mark_complete, set_bar_message,
-        set_run_status, start_bar, start_run_progress, start_spinner, write_status_line,
+        finish_stage, format_path_for_tracing, format_usage_details, init_tracing, mark_complete,
+        set_bar_message, set_run_status, start_bar, start_run_progress, start_spinner,
+        write_status_line,
     },
     qpdf_outline::{open_pdf, read_existing_outline, write_outline},
 };
@@ -41,7 +42,7 @@ async fn main() -> Result<()> {
             agent_calls,
         } => {
             write_status_line(&format!(
-                "Stopped: {reason} | agent calls {agent_calls} | tokens {}",
+                "Stopped: {reason} | agent calls {agent_calls} | {}",
                 format_usage_details(&usage)
             ))?;
         }
@@ -51,7 +52,7 @@ async fn main() -> Result<()> {
             agent_calls,
         } => {
             write_status_line(&format!(
-                "Stopped: existing outline already matches the table of contents ({entries} entries) | agent calls {agent_calls} | tokens {}",
+                "Stopped: existing outline already matches the table of contents ({entries} entries) | agent calls {agent_calls} | {}",
                 format_usage_details(&usage)
             ))?;
         }
@@ -62,8 +63,8 @@ async fn main() -> Result<()> {
             agent_calls,
         } => {
             write_status_line(&format!(
-                "Updated outline with {entries} entries: {} | agent calls {agent_calls} | tokens {}",
-                output_path.display(),
+                "Updated outline with {entries} entries: {} | agent calls {agent_calls} | {}",
+                format_path_for_tracing(&output_path),
                 format_usage_details(&usage)
             ))?;
         }
@@ -78,15 +79,15 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     let _run_guard = run_span.enter();
     let mut agent_progress = AgentProgress::default();
 
-    tracing::info!(input = %args.input.display(), "Run started");
+    tracing::info!(input = %format_path_for_tracing(&args.input), "Run started");
     set_run_status(
         &run_span,
         &args.input,
-        "open PDF",
+        "opening PDF",
         &agent_progress.usage,
         agent_progress.calls,
     );
-    let open_span = start_spinner("open_pdf", "open PDF");
+    let open_span = start_spinner("open_pdf", "opening PDF");
     let pdf = open_pdf(&args.input)?;
     let page_count = pdf
         .get_num_pages()
@@ -96,7 +97,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     finish_stage(
         &run_span,
         &args.input,
-        "PDF ready",
+        "PDF loaded",
         &agent_progress.usage,
         agent_progress.calls,
     );
@@ -104,11 +105,11 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     set_run_status(
         &run_span,
         &args.input,
-        "prepare workspace",
+        "preparing workspace",
         &agent_progress.usage,
         agent_progress.calls,
     );
-    let workspace_span = start_spinner("workspace", "prepare workspace");
+    let workspace_span = start_spinner("workspace", "preparing workspace");
     let workspace = PdfWorkspace::new(args.input.clone(), page_count);
     tracing::info!(page_count = workspace.page_count, "Workspace ready");
     drop(workspace_span);
@@ -146,14 +147,14 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         set_run_status(
             &run_span,
             &args.input,
-            "render TOC samples",
+            "rendering TOC samples",
             &agent_progress.usage,
             agent_progress.calls,
         );
         let discovery_render_span = start_bar(
             "render_toc_samples",
             discovery_pages.len() as u64,
-            format!("TOC samples {}", discovery_pages.len()),
+            format!("rendering TOC samples {}", discovery_pages.len()),
         );
         let discovery_rendered = workspace.render_pages_with_progress(
             &discovery_pages,
@@ -161,7 +162,10 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
                 discovery_render_span.pb_set_position(completed as u64);
                 set_bar_message(
                     &discovery_render_span,
-                    format!("page {physical_page} {completed}/{}", discovery_pages.len()),
+                    format!(
+                        "rendering sample page {physical_page} ({completed}/{})",
+                        discovery_pages.len()
+                    ),
                 );
             },
         )?;
@@ -181,20 +185,27 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         set_run_status(
             &run_span,
             &args.input,
-            "detect TOC",
+            "locating TOC",
             &agent_progress.usage,
             agent_progress.calls,
         );
         let discovery_span = start_spinner(
             "locate_toc",
-            format!("detect TOC {}", discovery_rendered.len()),
+            format!("locating TOC from {} sample pages", discovery_rendered.len()),
         );
+        let discovery_message =
+            format!("locating TOC from {} sample pages", discovery_rendered.len());
         let LlmCall {
             data: toc_page_batch,
             usage,
-        } = identify_toc_pages(&llm_config, &discovery_rendered)
-            .instrument(discovery_span.clone())
-            .await?;
+        } = identify_toc_pages(
+            &llm_config,
+            &discovery_rendered,
+            Some(&discovery_span),
+            &discovery_message,
+        )
+        .instrument(discovery_span.clone())
+        .await?;
         agent_progress.record(usage);
         tracing::info!(
             sampled_pages = discovery_rendered.len(),
@@ -211,7 +222,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         finish_stage(
             &run_span,
             &args.input,
-            "TOC detected",
+            "TOC located",
             &agent_progress.usage,
             agent_progress.calls,
         );
@@ -236,7 +247,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
             &run_span,
             &args.input,
             stage_count,
-            "no TOC found",
+            "no table of contents found",
             &agent_progress.usage,
             agent_progress.calls,
         );
@@ -250,21 +261,24 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     set_run_status(
         &run_span,
         &args.input,
-        "render TOC pages",
+        "rendering TOC pages",
         &agent_progress.usage,
         agent_progress.calls,
     );
     let toc_render_span = start_bar(
         "render_toc_pages",
         toc_pages.len() as u64,
-        format!("TOC pages {}", toc_pages.len()),
+        format!("rendering TOC pages {}", toc_pages.len()),
     );
     let rendered_toc_pages =
         workspace.render_pages_with_progress(&toc_pages, |completed, physical_page| {
             toc_render_span.pb_set_position(completed as u64);
             set_bar_message(
                 &toc_render_span,
-                format!("page {physical_page} {completed}/{}", toc_pages.len()),
+                format!(
+                    "rendering TOC page {physical_page} ({completed}/{})",
+                    toc_pages.len()
+                ),
             );
         })?;
     tracing::info!(
@@ -283,18 +297,24 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     set_run_status(
         &run_span,
         &args.input,
-        "extract TOC",
+        "extracting TOC",
         &agent_progress.usage,
         agent_progress.calls,
     );
     let extract_span = start_spinner(
         "extract_toc",
-        format!("extract TOC {}", rendered_toc_pages.len()),
+        format!("extracting TOC from {} pages", rendered_toc_pages.len()),
     );
+    let extract_message = format!("extracting TOC from {} pages", rendered_toc_pages.len());
     let LlmCall {
         data: extracted,
         usage,
-    } = extract_toc(&llm_config, &rendered_toc_pages)
+    } = extract_toc(
+        &llm_config,
+        &rendered_toc_pages,
+        Some(&extract_span),
+        &extract_message,
+    )
         .instrument(extract_span.clone())
         .await?;
     agent_progress.record(usage);
@@ -327,7 +347,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
             &run_span,
             &args.input,
             stage_count,
-            "no TOC found",
+            "no table of contents found",
             &agent_progress.usage,
             agent_progress.calls,
         );
@@ -351,21 +371,24 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     set_run_status(
         &run_span,
         &args.input,
-        "render label samples",
+        "rendering page number samples",
         &agent_progress.usage,
         agent_progress.calls,
     );
     let label_render_span = start_bar(
         "render_label_samples",
         label_pages.len() as u64,
-        format!("label samples {}", label_pages.len()),
+        format!("rendering page number samples {}", label_pages.len()),
     );
     let rendered_label_pages =
         workspace.render_pages_with_progress(&label_pages, |completed, physical_page| {
             label_render_span.pb_set_position(completed as u64);
             set_bar_message(
                 &label_render_span,
-                format!("page {physical_page} {completed}/{}", label_pages.len()),
+                format!(
+                    "rendering sample page {physical_page} ({completed}/{})",
+                    label_pages.len()
+                ),
             );
         })?;
     tracing::info!(
@@ -376,7 +399,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     finish_stage(
         &run_span,
         &args.input,
-        "label samples ready",
+        "page number samples ready",
         &agent_progress.usage,
         agent_progress.calls,
     );
@@ -384,18 +407,30 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     set_run_status(
         &run_span,
         &args.input,
-        "read page labels",
+        "reading printed page numbers",
         &agent_progress.usage,
         agent_progress.calls,
     );
     let observe_span = start_spinner(
         "observe_page_labels",
-        format!("read labels {}", rendered_label_pages.len()),
+        format!(
+            "reading printed page numbers from {} pages",
+            rendered_label_pages.len()
+        ),
+    );
+    let observe_message = format!(
+        "reading printed page numbers from {} pages",
+        rendered_label_pages.len()
     );
     let LlmCall {
         data: observations,
         usage,
-    } = observe_page_labels(&llm_config, &rendered_label_pages)
+    } = observe_page_labels(
+        &llm_config,
+        &rendered_label_pages,
+        Some(&observe_span),
+        &observe_message,
+    )
         .instrument(observe_span.clone())
         .await?;
     agent_progress.record(usage);
@@ -409,7 +444,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     finish_stage(
         &run_span,
         &args.input,
-        "page labels ready",
+        "printed page numbers ready",
         &agent_progress.usage,
         agent_progress.calls,
     );
@@ -417,11 +452,14 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     set_run_status(
         &run_span,
         &args.input,
-        "resolve page numbers",
+        "matching TOC entries to PDF pages",
         &agent_progress.usage,
         agent_progress.calls,
     );
-    let calibrate_span = start_spinner("resolve_entries", "resolve page numbers");
+    let calibrate_span = start_spinner(
+        "resolve_entries",
+        "matching TOC entries to PDF pages",
+    );
     let calibrated = workspace.calibrate_entries_from_observations(&toc_entries, &observations);
     let calibrated = ensure_toc_heading_entry(toc_heading_page, calibrated);
     tracing::info!(
@@ -433,7 +471,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     finish_stage(
         &run_span,
         &args.input,
-        "page numbers resolved",
+        "page mapping ready",
         &agent_progress.usage,
         agent_progress.calls,
     );
@@ -441,11 +479,11 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     set_run_status(
         &run_span,
         &args.input,
-        "compare outlines",
+        "checking existing outline",
         &agent_progress.usage,
         agent_progress.calls,
     );
-    let compare_span = start_spinner("compare_outline", "compare outlines");
+    let compare_span = start_spinner("compare_outline", "checking existing outline");
     let existing_outline = read_existing_outline(&pdf)?;
     let normalized_existing = normalize_outline_for_compare(
         existing_outline
@@ -468,7 +506,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         finish_stage(
             &run_span,
             &args.input,
-            "already aligned",
+            "outline already matches",
             &agent_progress.usage,
             agent_progress.calls,
         );
@@ -476,7 +514,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
             &run_span,
             &args.input,
             stage_count,
-            "already aligned",
+            "outline already matches",
             &agent_progress.usage,
             agent_progress.calls,
         );
@@ -489,25 +527,25 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     finish_stage(
         &run_span,
         &args.input,
-        "outline compared",
+        "outline checked",
         &agent_progress.usage,
         agent_progress.calls,
     );
 
     let output_path = determine_output_path(&args.input, args.output.as_deref());
-    tracing::info!(output_path = %output_path.display(), "Output path");
+    tracing::info!(output_path = %format_path_for_tracing(&output_path), "Output path");
     set_run_status(
         &run_span,
         &args.input,
-        "write outline",
+        "saving updated outline",
         &agent_progress.usage,
         agent_progress.calls,
     );
-    let write_span = start_spinner("write_outline", "write outline");
+    let write_span = start_spinner("write_outline", "saving updated outline");
     if same_path(&args.input, &output_path) {
         let temp_output = temporary_output_path(&args.input);
         tracing::info!(
-            temp_output = %temp_output.display(),
+            temp_output = %format_path_for_tracing(&temp_output),
             "Temporary output"
         );
         write_outline(&pdf, &calibrated, &temp_output)?;
@@ -518,7 +556,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
             )
         })?;
         tracing::info!(
-            output_path = %args.input.display(),
+            output_path = %format_path_for_tracing(&args.input),
             entries = calibrated.len(),
             "Outline written"
         );
@@ -526,7 +564,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         finish_stage(
             &run_span,
             &args.input,
-            "outline written",
+            "outline saved",
             &agent_progress.usage,
             agent_progress.calls,
         );
@@ -534,7 +572,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
             &run_span,
             &args.input,
             stage_count,
-            "completed",
+            "done",
             &agent_progress.usage,
             agent_progress.calls,
         );
@@ -547,7 +585,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     } else {
         write_outline(&pdf, &calibrated, &output_path)?;
         tracing::info!(
-            output_path = %output_path.display(),
+            output_path = %format_path_for_tracing(&output_path),
             entries = calibrated.len(),
             "Outline written"
         );
@@ -555,7 +593,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         finish_stage(
             &run_span,
             &args.input,
-            "outline written",
+            "outline saved",
             &agent_progress.usage,
             agent_progress.calls,
         );
@@ -563,7 +601,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
             &run_span,
             &args.input,
             stage_count,
-            "completed",
+            "done",
             &agent_progress.usage,
             agent_progress.calls,
         );

@@ -17,9 +17,14 @@ use tracing_subscriber::{EnvFilter, Layer};
 static TRACING_INIT: Once = Once::new();
 
 const DEFAULT_LOG_FILTER: &str = "info";
-const MAX_STAGE_MESSAGE_LEN: usize = 96;
-const MAX_RUN_MESSAGE_LEN: usize = 96;
-const MAX_PROGRESS_PATH_LEN: usize = 32;
+const MAX_STAGE_MESSAGE_LEN: usize = 180;
+const MAX_STAGE_LABEL_LEN: usize = 48;
+const MAX_RUN_STAGE_LEN: usize = 36;
+const MAX_PROGRESS_PATH_LEN: usize = 56;
+const MAX_TRACING_PATH_LEN: usize = 88;
+const MAX_OUTPUT_WINDOW_LEN: usize = 44;
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_AI_USAGE: &str = "\x1b[38;5;110m";
 
 pub fn init_tracing() {
     TRACING_INIT.call_once(|| {
@@ -41,7 +46,7 @@ pub fn init_tracing() {
 }
 
 pub fn start_run_progress(input: &std::path::Path, stage_count: u64) -> Span {
-    let span = tracing::info_span!("outline", file = %input.display());
+    let span = tracing::info_span!("outline", file = %format_path_for_tracing(input));
     span.pb_set_style(
         &ProgressStyle::with_template(
             "{wide_msg:.cyan}\n[{wide_bar:.green/cyan}] {pos}/{len} steps | elapsed {elapsed_precise}",
@@ -51,7 +56,7 @@ pub fn start_run_progress(input: &std::path::Path, stage_count: u64) -> Span {
     );
     span.pb_set_length(stage_count);
     span.pb_set_position(0);
-    set_run_status(&span, input, "starting", &Usage::new(), 0);
+    set_run_status(&span, input, "starting up", &Usage::new(), 0);
     span.pb_start();
     span
 }
@@ -116,6 +121,25 @@ pub fn set_bar_message(span: &Span, message: impl AsRef<str>) {
     ));
 }
 
+pub fn set_spinner_message(
+    span: &Span,
+    message: impl AsRef<str>,
+    output_chars: Option<usize>,
+    output_window: Option<&str>,
+) {
+    let mut parts = vec![format_display_message(message.as_ref(), MAX_STAGE_LABEL_LEN)];
+    if let Some(output_chars) = output_chars {
+        parts.push(format!("chars {}", format_count(output_chars as u64)));
+    }
+    if let Some(output_window) = output_window {
+        let window = format_output_window(output_window, MAX_OUTPUT_WINDOW_LEN);
+        if !window.is_empty() {
+            parts.push(format!("\"{window}\""));
+        }
+    }
+    span.pb_set_message(&parts.join(" | "));
+}
+
 pub fn set_run_status(
     span: &Span,
     input: &Path,
@@ -132,28 +156,7 @@ pub fn set_run_status(
 }
 
 pub fn format_usage_details(usage: &Usage) -> String {
-    let mut details = format!(
-        "input {}, output {}, total {}",
-        format_count(usage.input_tokens),
-        format_count(usage.output_tokens),
-        format_count(usage.total_tokens)
-    );
-
-    if usage.cached_input_tokens > 0 {
-        details.push_str(&format!(
-            ", cache read {}",
-            format_count(usage.cached_input_tokens)
-        ));
-    }
-
-    if usage.cache_creation_input_tokens > 0 {
-        details.push_str(&format!(
-            ", cache write {}",
-            format_count(usage.cache_creation_input_tokens)
-        ));
-    }
-
-    details
+    colorize_ai_usage(&format_usage_details_plain(usage))
 }
 
 pub fn write_status_line(message: &str) -> io::Result<()> {
@@ -174,31 +177,34 @@ fn default_env_filter() -> EnvFilter {
 }
 
 fn display_path(path: &Path, max_len: usize) -> String {
-    let display_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .map(str::to_owned)
-        .unwrap_or_else(|| path.display().to_string());
-    format_display_message(&display_name, max_len)
+    format_middle_ellipsis(&path.display().to_string(), max_len)
 }
 
 fn format_run_message(input: &Path, stage: &str, usage: &Usage, agent_calls: u64) -> String {
-    format_display_message(
-        &format!(
-            "{} | {} | {}",
-            display_path(input, MAX_PROGRESS_PATH_LEN),
-            stage,
-            format_agent_summary(agent_calls, usage)
-        ),
-        MAX_RUN_MESSAGE_LEN,
+    format!(
+        "{} | {} | {}",
+        display_path(input, MAX_PROGRESS_PATH_LEN),
+        format_display_message(stage, MAX_RUN_STAGE_LEN),
+        format_agent_summary(agent_calls, usage)
     )
 }
 
 fn format_agent_summary(agent_calls: u64, usage: &Usage) -> String {
     format!(
-        "calls {}, tokens {}",
+        "calls {} | {}",
         format_count(agent_calls),
-        format_count(usage.total_tokens)
+        format_usage_details(usage)
+    )
+}
+
+fn format_usage_details_plain(usage: &Usage) -> String {
+    format!(
+        "AI in {} out {} total {} cache rd {} wr {}",
+        format_count(usage.input_tokens),
+        format_count(usage.output_tokens),
+        format_count(usage.total_tokens),
+        format_count(usage.cached_input_tokens),
+        format_count(usage.cache_creation_input_tokens)
     )
 }
 
@@ -226,9 +232,57 @@ fn format_display_message(message: &str, max_len: usize) -> String {
     format!("{truncated}...")
 }
 
+fn format_middle_ellipsis(message: &str, max_len: usize) -> String {
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let char_count = normalized.chars().count();
+    if char_count <= max_len {
+        return normalized;
+    }
+    if max_len <= 3 {
+        return ".".repeat(max_len);
+    }
+
+    let head_len = (max_len - 3) / 2;
+    let tail_len = max_len - 3 - head_len;
+    let head: String = normalized.chars().take(head_len).collect();
+    let tail: String = normalized
+        .chars()
+        .skip(char_count.saturating_sub(tail_len))
+        .collect();
+    format!("{head}...{tail}")
+}
+
+fn format_output_window(message: &str, max_len: usize) -> String {
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let char_count = normalized.chars().count();
+    if char_count <= max_len {
+        return normalized;
+    }
+    if max_len <= 3 {
+        return ".".repeat(max_len);
+    }
+
+    let tail_len = max_len - 3;
+    let tail: String = normalized
+        .chars()
+        .skip(char_count.saturating_sub(tail_len))
+        .collect();
+    format!("...{tail}")
+}
+
+fn colorize_ai_usage(message: &str) -> String {
+    format!("{ANSI_AI_USAGE}{message}{ANSI_RESET}")
+}
+
+pub fn format_path_for_tracing(path: &Path) -> String {
+    display_path(path, MAX_TRACING_PATH_LEN)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{format_count, format_display_message};
+    use super::{
+        format_count, format_display_message, format_middle_ellipsis, format_output_window,
+    };
 
     #[test]
     fn format_display_message_compacts_whitespace() {
@@ -243,6 +297,22 @@ mod tests {
         assert_eq!(
             format_display_message("abcdefghijklmnopqrstuvwxyz", 10),
             "abcdefg..."
+        );
+    }
+
+    #[test]
+    fn format_middle_ellipsis_keeps_head_and_tail() {
+        assert_eq!(
+            format_middle_ellipsis("abcdefghijklmnopqrstuvwxyz", 10),
+            "abc...wxyz"
+        );
+    }
+
+    #[test]
+    fn format_output_window_keeps_tail() {
+        assert_eq!(
+            format_output_window("abcdefghijklmnopqrstuvwxyz", 10),
+            "...tuvwxyz"
         );
     }
 
