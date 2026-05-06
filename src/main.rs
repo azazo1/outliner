@@ -18,7 +18,7 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 use crate::{
     config::{AppArgs, CliArgs, resolve_args},
     llm::{LlmConfig, extract_toc},
-    model::{RunOutcome, normalize_outline_for_compare, normalize_toc_entries, parse_page_label},
+    model::{RunOutcome, normalize_outline_for_compare, normalize_toc_entries},
     pdf_support::PdfWorkspace,
     progress::{
         finish_stage, init_tracing, mark_complete, set_bar_message, start_bar, start_run_progress,
@@ -78,12 +78,9 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
 
     let candidate_span = start_spinner(
         "candidate_toc_pages",
-        format!(
-            "scanning first {} pages for toc candidates",
-            args.front_pages.min(page_count)
-        ),
+        format!("searching across {} pages for toc candidates", page_count),
     );
-    let candidate_pages = workspace.candidate_toc_pages(args.front_pages, args.max_toc_pages)?;
+    let candidate_pages = workspace.candidate_toc_pages(args.max_toc_pages)?;
     drop(candidate_span);
     finish_stage(&run_span, "candidate pages selected");
 
@@ -245,12 +242,4 @@ fn temporary_output_path(input: &Path) -> PathBuf {
 
 fn same_path(left: &Path, right: &Path) -> bool {
     left == right
-}
-
-#[allow(dead_code)]
-fn _page_label_is_numeric(value: &str) -> bool {
-    matches!(
-        parse_page_label(value),
-        Some(crate::model::PageLabel::Arabic(_))
-    )
 }

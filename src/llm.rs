@@ -48,7 +48,7 @@ pub async fn extract_toc(config: &LlmConfig, pages: &[RenderedPage]) -> Result<T
         bail!("no candidate pages were provided to the LLM extractor");
     }
 
-    let client = build_openai_client(config)?;
+    let client = build_openai_client(config)?.completions_api();
     let model = config.model.as_deref().unwrap_or(openai::GPT_4O_MINI);
     let extractor = client
         .extractor::<TocExtraction>(model)
@@ -70,7 +70,7 @@ pub async fn observe_page_labels(
         return Ok(Vec::new());
     }
 
-    let client = build_openai_client(config)?;
+    let client = build_openai_client(config)?.completions_api();
     let model = config.model.as_deref().unwrap_or(openai::GPT_4O_MINI);
     let extractor = client
         .extractor::<VisionPageObservationBatch>(model)

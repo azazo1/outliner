@@ -8,7 +8,6 @@ use clap::Parser;
 use serde::Deserialize;
 
 const DEFAULT_CONFIG_PATH: &str = "~/.config/outliner/config.toml";
-const DEFAULT_FRONT_PAGES: usize = 20;
 const DEFAULT_MAX_TOC_PAGES: usize = 6;
 const DEFAULT_ANCHOR_WINDOW: usize = 3;
 const DEFAULT_ANCHOR_BUDGET: usize = 40;
@@ -29,8 +28,6 @@ pub struct CliArgs {
     )]
     pub config: Option<PathBuf>,
     #[arg(long)]
-    pub front_pages: Option<usize>,
-    #[arg(long)]
     pub max_toc_pages: Option<usize>,
     #[arg(long)]
     pub anchor_window: Option<usize>,
@@ -45,7 +42,6 @@ pub struct AppArgs {
     pub model: Option<String>,
     pub api_base: Option<String>,
     pub api_key: Option<String>,
-    pub front_pages: usize,
     pub max_toc_pages: usize,
     pub anchor_window: usize,
     pub anchor_budget: usize,
@@ -57,7 +53,6 @@ struct FileConfig {
     model: Option<String>,
     api_base: Option<String>,
     api_key: Option<String>,
-    front_pages: Option<usize>,
     max_toc_pages: Option<usize>,
     anchor_window: Option<usize>,
     anchor_budget: Option<usize>,
@@ -111,27 +106,38 @@ fn load_file_config(source: Option<ConfigSource>) -> Result<FileConfig> {
 }
 
 fn merge_args(cli: CliArgs, file: FileConfig) -> Result<AppArgs> {
+    let CliArgs {
+        input,
+        output,
+        model,
+        config: _,
+        max_toc_pages,
+        anchor_window,
+        anchor_budget,
+    } = cli;
+    let FileConfig {
+        model: file_model,
+        api_base,
+        api_key,
+        max_toc_pages: file_max_toc_pages,
+        anchor_window: file_anchor_window,
+        anchor_budget: file_anchor_budget,
+    } = file;
+
     Ok(AppArgs {
-        input: cli.input,
-        output: cli.output,
-        model: normalize_optional_string(cli.model.or(file.model)),
-        api_base: normalize_optional_string(file.api_base),
-        api_key: normalize_optional_string(file.api_key),
-        front_pages: cli
-            .front_pages
-            .or(file.front_pages)
-            .unwrap_or(DEFAULT_FRONT_PAGES),
-        max_toc_pages: cli
-            .max_toc_pages
-            .or(file.max_toc_pages)
+        input,
+        output,
+        model: normalize_optional_string(model.or(file_model)),
+        api_base: normalize_optional_string(api_base),
+        api_key: normalize_optional_string(api_key),
+        max_toc_pages: max_toc_pages
+            .or(file_max_toc_pages)
             .unwrap_or(DEFAULT_MAX_TOC_PAGES),
-        anchor_window: cli
-            .anchor_window
-            .or(file.anchor_window)
+        anchor_window: anchor_window
+            .or(file_anchor_window)
             .unwrap_or(DEFAULT_ANCHOR_WINDOW),
-        anchor_budget: cli
-            .anchor_budget
-            .or(file.anchor_budget)
+        anchor_budget: anchor_budget
+            .or(file_anchor_budget)
             .unwrap_or(DEFAULT_ANCHOR_BUDGET),
     })
 }
@@ -152,8 +158,8 @@ fn expand_path(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppArgs, CliArgs, DEFAULT_ANCHOR_BUDGET, DEFAULT_ANCHOR_WINDOW, DEFAULT_FRONT_PAGES,
-        DEFAULT_MAX_TOC_PAGES, FileConfig, expand_path, merge_args,
+        AppArgs, CliArgs, DEFAULT_ANCHOR_BUDGET, DEFAULT_ANCHOR_WINDOW, DEFAULT_MAX_TOC_PAGES,
+        FileConfig, expand_path, merge_args,
     };
     use std::path::{Path, PathBuf};
 
@@ -164,7 +170,6 @@ mod tests {
             output: Some(PathBuf::from("cli-out.pdf")),
             model: Some("gpt-4.1-mini".to_string()),
             config: None,
-            front_pages: Some(11),
             max_toc_pages: None,
             anchor_window: None,
             anchor_budget: Some(25),
@@ -173,7 +178,6 @@ mod tests {
             model: Some("gpt-4o-mini".to_string()),
             api_base: Some("https://example.com/v1".to_string()),
             api_key: Some("file-key".to_string()),
-            front_pages: Some(7),
             max_toc_pages: Some(5),
             anchor_window: Some(4),
             anchor_budget: Some(17),
@@ -189,7 +193,6 @@ mod tests {
                 model: Some("gpt-4.1-mini".to_string()),
                 api_base: Some("https://example.com/v1".to_string()),
                 api_key: Some("file-key".to_string()),
-                front_pages: 11,
                 max_toc_pages: 5,
                 anchor_window: 4,
                 anchor_budget: 25,
@@ -204,7 +207,6 @@ mod tests {
             output: None,
             model: None,
             config: None,
-            front_pages: None,
             max_toc_pages: None,
             anchor_window: None,
             anchor_budget: None,
@@ -220,7 +222,6 @@ mod tests {
                 model: None,
                 api_base: None,
                 api_key: None,
-                front_pages: DEFAULT_FRONT_PAGES,
                 max_toc_pages: DEFAULT_MAX_TOC_PAGES,
                 anchor_window: DEFAULT_ANCHOR_WINDOW,
                 anchor_budget: DEFAULT_ANCHOR_BUDGET,

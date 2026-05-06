@@ -31,45 +31,24 @@ impl PdfWorkspace {
         })
     }
 
-    pub fn candidate_toc_pages(
-        &self,
-        front_pages: usize,
-        max_pages: usize,
-    ) -> Result<Vec<CandidatePage>> {
-        let mut snapshots = Vec::new();
-        let end = front_pages.min(self.page_count);
+    pub fn candidate_toc_pages(&self, max_pages: usize) -> Result<Vec<CandidatePage>> {
+        let max_pages = max_pages.max(1);
+        let mut snapshots = Vec::with_capacity(self.page_count);
 
-        for physical_page in 1..=end {
+        for physical_page in 1..=self.page_count {
             let text = self
                 .text_pages
                 .get(physical_page - 1)
                 .cloned()
                 .with_context(|| format!("missing extracted text for PDF page {physical_page}"))?;
-            let toc_score = score_toc_page(&text);
+            let toc_score = score_toc_page(&text, physical_page, self.page_count);
             snapshots.push(CandidatePage {
                 physical_page,
                 toc_score,
             });
         }
 
-        snapshots.sort_by(|left, right| {
-            right
-                .toc_score
-                .cmp(&left.toc_score)
-                .then_with(|| left.physical_page.cmp(&right.physical_page))
-        });
-
-        let mut selected = snapshots
-            .into_iter()
-            .take(max_pages.max(1))
-            .collect::<Vec<_>>();
-        selected.sort_by_key(|page| page.physical_page);
-        Ok(selected)
-    }
-
-    #[allow(dead_code)]
-    pub fn render_pages(&self, pages: &[usize]) -> Result<Vec<RenderedPage>> {
-        self.render_pages_with_progress(pages, |_, _| {})
+        Ok(select_candidate_toc_pages(snapshots, max_pages))
     }
 
     pub fn render_pages_with_progress<F>(
@@ -135,23 +114,6 @@ impl PdfWorkspace {
             .into_iter()
             .max_by_key(|(_, score)| *score)
             .and_then(|(offset, score)| (score >= 2).then_some(offset))
-    }
-
-    #[allow(dead_code)]
-    pub fn calibrate_entries(
-        &self,
-        entries: &[crate::model::TocCandidateEntry],
-        observations: &[VisionPageObservation],
-        anchor_window: usize,
-        anchor_budget: usize,
-    ) -> Result<Vec<OutlineEntry>> {
-        self.calibrate_entries_with_progress(
-            entries,
-            observations,
-            anchor_window,
-            anchor_budget,
-            |_, _| {},
-        )
     }
 
     pub fn calibrate_entries_with_progress<F>(
@@ -273,6 +235,74 @@ impl PdfWorkspace {
     }
 }
 
+fn select_candidate_toc_pages(
+    mut snapshots: Vec<CandidatePage>,
+    max_pages: usize,
+) -> Vec<CandidatePage> {
+    if snapshots.is_empty() {
+        return Vec::new();
+    }
+
+    snapshots.sort_by(|left, right| {
+        right
+            .toc_score
+            .cmp(&left.toc_score)
+            .then_with(|| left.physical_page.cmp(&right.physical_page))
+    });
+
+    let strongest_score = snapshots.first().map(|page| page.toc_score).unwrap_or(0);
+    let minimum_seed_score = strongest_score.saturating_sub(2).max(2);
+    let seed_pages = snapshots
+        .iter()
+        .filter(|page| page.toc_score >= minimum_seed_score)
+        .take(max_pages)
+        .map(|page| page.physical_page)
+        .collect::<Vec<_>>();
+
+    let mut selected = Vec::new();
+    for physical_page in seed_pages {
+        for neighbor in physical_page.saturating_sub(1)..=physical_page.saturating_add(1) {
+            if neighbor == 0 {
+                continue;
+            }
+            if let Some(page) = snapshots.iter().find(|page| page.physical_page == neighbor) {
+                selected.push(page.clone());
+            }
+            if selected.len() >= max_pages {
+                break;
+            }
+        }
+        if selected.len() >= max_pages {
+            break;
+        }
+    }
+
+    if selected.is_empty() {
+        selected.push(snapshots[0].clone());
+    }
+
+    selected.sort_by_key(|page| page.physical_page);
+    selected.dedup_by_key(|page| page.physical_page);
+
+    if selected.len() < max_pages {
+        for page in snapshots {
+            if selected
+                .iter()
+                .any(|selected_page| selected_page.physical_page == page.physical_page)
+            {
+                continue;
+            }
+            selected.push(page);
+            if selected.len() >= max_pages {
+                break;
+            }
+        }
+        selected.sort_by_key(|page| page.physical_page);
+    }
+
+    selected
+}
+
 fn extract_text_pages(pdf_path: &Path, start: usize, end: usize) -> Result<Vec<String>> {
     let output = Command::new("pdftotext")
         .arg("-f")
@@ -350,17 +380,41 @@ fn render_page_png_bytes(pdf_path: &Path, physical_page: usize) -> Result<Vec<u8
         .with_context(|| format!("failed to read rendered page {}", image_path.display()))
 }
 
-fn score_toc_page(text: &str) -> usize {
+fn score_toc_page(text: &str, physical_page: usize, page_count: usize) -> usize {
     let title_re =
         Regex::new(r"(?im)\b(contents|table of contents)\b|目录").expect("toc title regex");
     let line_re =
         Regex::new(r"(?im)^.{2,}?(\.{2,}|\s)\s*([ivxlcdm]+|\d{1,4})\s*$").expect("toc line regex");
+    let numbered_list_re =
+        Regex::new(r"(?m)^\s*(\d+(?:\.\d+)*|[A-Z])[\.\)]\s+\S").expect("numbered toc line regex");
+    let empty_re = Regex::new(r"(?m)^\s*$").expect("empty line regex");
 
     let mut score = 0;
     if title_re.is_match(text) {
         score += 5;
     }
-    score += line_re.find_iter(text).count();
+    let toc_lines = line_re.find_iter(text).count();
+    score += toc_lines;
+    score += numbered_list_re.find_iter(text).count().min(3);
+
+    let line_count = text.lines().count();
+    if toc_lines >= 4 {
+        score += 3;
+    }
+    if line_count > 0 {
+        let blank_line_ratio = empty_re.find_iter(text).count() * 10 / line_count;
+        if blank_line_ratio <= 4 {
+            score += 1;
+        }
+    }
+
+    let early_book_cutoff = (page_count / 3).max(12);
+    if physical_page <= early_book_cutoff {
+        score += 2;
+    } else if physical_page <= page_count.saturating_sub(5) {
+        score = score.saturating_sub(2);
+    }
+
     score
 }
 
@@ -412,4 +466,49 @@ fn clamp_page_number(number: isize, page_count: usize) -> usize {
 fn looks_like_heading_match(normalized_title: &str, page_text: &str) -> bool {
     let normalized_page = sanitize_title(page_text);
     normalized_page.contains(normalized_title)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CandidatePage, score_toc_page, select_candidate_toc_pages};
+
+    #[test]
+    fn score_prefers_early_real_toc_pages() {
+        let toc_like = "Table of Contents\nChapter 1 ........ 1\nChapter 2 ........ 9\n";
+        let body_like = "Chapter 1\nThis chapter starts the main text.\n";
+
+        assert!(score_toc_page(toc_like, 4, 200) > score_toc_page(body_like, 4, 200));
+        assert!(score_toc_page(toc_like, 4, 200) > score_toc_page(toc_like, 150, 200));
+    }
+
+    #[test]
+    fn selection_expands_around_strong_seed_pages() {
+        let selected = select_candidate_toc_pages(
+            vec![
+                CandidatePage {
+                    physical_page: 3,
+                    toc_score: 1,
+                },
+                CandidatePage {
+                    physical_page: 4,
+                    toc_score: 8,
+                },
+                CandidatePage {
+                    physical_page: 5,
+                    toc_score: 7,
+                },
+                CandidatePage {
+                    physical_page: 20,
+                    toc_score: 6,
+                },
+            ],
+            3,
+        );
+
+        let pages = selected
+            .into_iter()
+            .map(|page| page.physical_page)
+            .collect::<Vec<_>>();
+        assert_eq!(pages, vec![3, 4, 5]);
+    }
 }
