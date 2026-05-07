@@ -3,3 +3,4 @@
 .DS_Store
 outlined_*.pdf
 .env
+/outputs/
