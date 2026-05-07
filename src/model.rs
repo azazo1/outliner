@@ -9,6 +9,12 @@ pub struct RenderedPage {
     pub png_bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExtractedPageText {
+    pub physical_page: usize,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageRange {
     pub start: usize,

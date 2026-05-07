@@ -19,8 +19,8 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 use crate::{
     config::{AppArgs, CliArgs, resolve_args},
     llm::{
-        LlmCall, LlmConfig, VisionRequestConfig, extract_toc, identify_toc_pages,
-        observe_page_labels,
+        LlmCall, LlmConfig, TocPageAssessmentBatch, VisionRequestConfig, extract_toc,
+        identify_toc_pages, infer_toc_from_page_text, observe_page_labels,
     },
     model::{
         OutlineEntry, PageRange, RunOutcome, normalize_outline_for_compare, normalize_toc_entries,
@@ -583,6 +583,119 @@ async fn discover_toc_range(
             run_span,
             &args.input,
             format!(
+                "extracting PDF text in pages {}..{}",
+                candidate_range.start, candidate_range.end
+            ),
+            &agent_progress.usage,
+            agent_progress.calls,
+        );
+        let extract_text_span = start_bar(
+            "extract_pdf_text",
+            discovery_pages.len() as u64,
+            format!(
+                "extracting PDF text {}..{}",
+                candidate_range.start, candidate_range.end
+            ),
+        );
+        match workspace.extract_page_text_with_progress(&discovery_pages, |completed, physical_page| {
+            extract_text_span.pb_set_position(completed as u64);
+            set_bar_message(
+                &extract_text_span,
+                format!(
+                    "extracting text from page {physical_page} ({completed}/{})",
+                    discovery_pages.len()
+                ),
+            );
+        }) {
+            Ok(extracted_pages) => {
+                drop(extract_text_span);
+                if let Some(refined) = try_discover_toc_range_from_text(
+                    "extracting PDF page text",
+                    "inferring TOC from PDF text",
+                    &args.input,
+                    run_span,
+                    agent_progress,
+                    extracted_pages,
+                    llm_config,
+                    args.toc,
+                    workspace,
+                    candidate_range,
+                )
+                .await?
+                {
+                    return Ok(Some(refined));
+                }
+            }
+            Err(error) => {
+                drop(extract_text_span);
+                tracing::warn!(
+                    search_start = candidate_range.start,
+                    search_end = candidate_range.end,
+                    error = %error,
+                    "PDF text extraction failed; falling back"
+                );
+            }
+        }
+
+        set_run_status(
+            run_span,
+            &args.input,
+            format!(
+                "OCRing pages {}..{}",
+                candidate_range.start, candidate_range.end
+            ),
+            &agent_progress.usage,
+            agent_progress.calls,
+        );
+        let ocr_span = start_bar(
+            "ocr_toc_samples",
+            discovery_pages.len() as u64,
+            format!("OCRing TOC samples {}..{}", candidate_range.start, candidate_range.end),
+        );
+        match workspace.ocr_page_text_with_progress(&discovery_pages, |completed, physical_page| {
+            ocr_span.pb_set_position(completed as u64);
+            set_bar_message(
+                &ocr_span,
+                format!(
+                    "OCRing page {physical_page} ({completed}/{})",
+                    discovery_pages.len()
+                ),
+            );
+        }) {
+            Ok(extracted_pages) => {
+                drop(ocr_span);
+                if let Some(refined) = try_discover_toc_range_from_text(
+                    "OCRing page text",
+                    "inferring TOC from OCR text",
+                    &args.input,
+                    run_span,
+                    agent_progress,
+                    extracted_pages,
+                    llm_config,
+                    args.toc,
+                    workspace,
+                    candidate_range,
+                )
+                .await?
+                {
+                    return Ok(Some(refined));
+                }
+            }
+            Err(error) => {
+                drop(ocr_span);
+                tracing::warn!(
+                    search_start = candidate_range.start,
+                    search_end = candidate_range.end,
+                    error = %error,
+                    "OCR text extraction failed; falling back"
+                );
+            }
+        }
+
+        set_run_status(
+            run_span,
+            &args.input,
+            format!(
                 "rendering TOC samples in pages {}..{}",
                 candidate_range.start, candidate_range.end
             ),
@@ -701,6 +814,124 @@ async fn discover_toc_range(
         last_range = Some(candidate_range);
         candidate_range = next_range;
     }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This helper threads existing discovery context through one inference stage"
+)]
+async fn try_discover_toc_range_from_text(
+    extracting_label: &str,
+    inferring_label: &str,
+    input: &Path,
+    run_span: &tracing::Span,
+    agent_progress: &mut AgentProgress,
+    extracted_pages: Vec<crate::model::ExtractedPageText>,
+    llm_config: &LlmConfig,
+    toc_hint: Option<crate::model::PageRangeSpec>,
+    workspace: &PdfWorkspace,
+    candidate_range: PageRange,
+) -> Result<Option<PageRange>> {
+    if extracted_pages.is_empty() {
+        return Ok(None);
+    }
+
+    let useful_pages = extracted_pages
+        .iter()
+        .filter(|page| !page.text.split_whitespace().collect::<String>().is_empty())
+        .count();
+    tracing::info!(
+        search_start = candidate_range.start,
+        search_end = candidate_range.end,
+        extracted_pages = extracted_pages.len(),
+        useful_pages,
+        stage = extracting_label,
+        "TOC text samples ready"
+    );
+    if useful_pages == 0 {
+        tracing::info!(
+            search_start = candidate_range.start,
+            search_end = candidate_range.end,
+            stage = extracting_label,
+            "TOC text samples empty; skipping text inference"
+        );
+        return Ok(None);
+    }
+
+    set_run_status(
+        run_span,
+        input,
+        format!(
+            "{inferring_label} in pages {}..{}",
+            candidate_range.start, candidate_range.end
+        ),
+        &agent_progress.usage,
+        agent_progress.calls,
+    );
+    let infer_message = format!(
+        "{inferring_label} in pages {}..{} from {} samples",
+        candidate_range.start,
+        candidate_range.end,
+        extracted_pages.len()
+    );
+    let infer_span = start_spinner("infer_toc_from_text", infer_message.clone());
+    let LlmCall { data, usage, calls } = infer_toc_from_page_text(
+        llm_config,
+        &extracted_pages,
+        Some(&infer_span),
+        &infer_message,
+    )
+    .instrument(infer_span.clone())
+    .await?;
+    agent_progress.record(usage, calls);
+    drop(infer_span);
+
+    let batch = TocPageAssessmentBatch {
+        toc_found: data.toc_found,
+        notes: data.notes,
+        assessments: data.assessments,
+    };
+    let hit_count = batch
+        .assessments
+        .iter()
+        .filter(|assessment| is_toc_hit(assessment))
+        .count();
+    tracing::info!(
+        search_start = candidate_range.start,
+        search_end = candidate_range.end,
+        hit_count,
+        "TOC inferred from text"
+    );
+
+    if hit_count > 0 {
+        let refined = workspace.refine_toc_range(toc_hint, &batch);
+        tracing::info!(
+            search_start = candidate_range.start,
+            search_end = candidate_range.end,
+            refined_start = refined.map(|range| range.start),
+            refined_end = refined.map(|range| range.end),
+            stage = inferring_label,
+            "TOC range refined from text hits"
+        );
+        return Ok(refined);
+    }
+
+    let next_range = workspace.narrow_toc_search_range(candidate_range, &batch);
+    tracing::info!(
+        search_start = candidate_range.start,
+        search_end = candidate_range.end,
+        refined_start = next_range.map(|range| range.start),
+        refined_end = next_range.map(|range| range.end),
+        stage = inferring_label,
+        "TOC range refined from text direction hints"
+    );
+    if let Some(next_range) = next_range
+        && workspace.should_render_full_toc_range(next_range)
+    {
+        return Ok(Some(next_range));
+    }
+
+    Ok(None)
 }
 
 #[derive(Debug, Default)]

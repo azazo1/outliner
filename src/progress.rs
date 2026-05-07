@@ -19,7 +19,6 @@ use unicode_width::UnicodeWidthChar;
 static TRACING_INIT: Once = Once::new();
 
 const DEFAULT_LOG_FILTER: &str = "info";
-const MAX_PROGRESS_PATH_LEN: usize = 56;
 const MAX_TRACING_PATH_LEN: usize = 88;
 const MAX_OUTPUT_WINDOW_LEN: usize = 44;
 const ANSI_RESET: &str = "\x1b[0m";
@@ -191,10 +190,18 @@ fn display_path(path: &Path, max_len: usize) -> String {
     format_middle_ellipsis(&path.display().to_string(), max_len)
 }
 
+fn progress_filename(path: &Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 fn format_run_message(input: &Path, stage: &str, usage: &Usage, agent_calls: u64) -> String {
     format!(
         "{} | {} | {}",
-        display_path(input, MAX_PROGRESS_PATH_LEN),
+        progress_filename(input),
         normalize_display_message(stage),
         format_agent_summary(agent_calls, usage)
     )
@@ -319,7 +326,7 @@ pub fn format_path_for_tracing(path: &Path) -> String {
 mod tests {
     use super::{
         format_count, format_middle_ellipsis, format_output_window, format_path_for_tracing,
-        normalize_display_message,
+        normalize_display_message, progress_filename,
     };
     use std::path::Path;
 
@@ -376,5 +383,13 @@ mod tests {
 
         assert!(formatted.contains("..."));
         assert!(formatted.ends_with("file-name-with-extra-suffix.pdf"));
+    }
+
+    #[test]
+    fn progress_filename_uses_only_basename() {
+        assert_eq!(
+            progress_filename(Path::new("/Users/example/books/sample-text.pdf")),
+            "sample-text.pdf"
+        );
     }
 }

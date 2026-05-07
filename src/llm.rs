@@ -24,7 +24,7 @@ use std::{
 use tracing::Span;
 use unicode_width::UnicodeWidthChar;
 
-use crate::model::{RenderedPage, TocExtraction};
+use crate::model::{ExtractedPageText, RenderedPage, TocExtraction};
 use crate::progress::{set_spinner_message, start_spinner};
 
 const OUTPUT_WINDOW_LEN: usize = 44;
@@ -68,6 +68,22 @@ Rules:
 - Always return one assessment per input page.
 "#;
 
+const TEXT_TOC_DISCOVERY_PREAMBLE: &str = r#"
+You inspect extracted PDF page text and infer where the table of contents most likely is.
+
+Rules:
+- Each input item contains a PDF physical page number and the text extracted from that page.
+- Use the extracted text to decide whether a page is TOC or whether the TOC is more likely before or after that page.
+- Set toc_direction_hint to:
+  - hit when the page text itself is clearly a table of contents page.
+  - after when the page text strongly suggests the TOC is later in the document, such as cover, title, copyright, publication info, CIP, dedication, foreword, or very early front matter.
+  - before when the page text strongly suggests the TOC is earlier in the document, such as chapter body text, appendix, bibliography, references, index, colophon, or late preface pages with closing signatures or dates.
+  - unknown when the text is insufficient or too noisy to infer direction.
+- Prefer hit over before or after when the text itself clearly contains a real TOC.
+- Always return one assessment per input page.
+- toc_found should be true when at least one page is marked as hit.
+"#;
+
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
     pub model: Option<String>,
@@ -107,6 +123,16 @@ pub struct TocPageAssessment {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TocPageAssessmentBatch {
+    #[schemars(required)]
+    pub toc_found: bool,
+    #[schemars(required)]
+    pub notes: Option<String>,
+    #[schemars(required)]
+    pub assessments: Vec<TocPageAssessment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TocTextInferenceBatch {
     #[schemars(required)]
     pub toc_found: bool,
     #[schemars(required)]
@@ -159,6 +185,30 @@ pub async fn identify_toc_pages(
         },
         merge_toc_page_assessment_batches,
         TOC_DISCOVERY_PREAMBLE,
+        progress_span,
+        progress_label,
+    )
+    .await
+}
+
+pub async fn infer_toc_from_page_text(
+    config: &LlmConfig,
+    pages: &[ExtractedPageText],
+    progress_span: Option<&Span>,
+    progress_label: &str,
+) -> Result<LlmCall<TocTextInferenceBatch>> {
+    if pages.is_empty() {
+        bail!("no extracted page text was provided to the TOC text locator");
+    }
+
+    let prompt = build_text_page_message(
+        pages,
+        "Infer which of these extracted PDF pages are TOC pages, and otherwise whether the TOC is before or after them.",
+    )?;
+    stream_structured_output(
+        config,
+        TEXT_TOC_DISCOVERY_PREAMBLE,
+        prompt,
         progress_span,
         progress_label,
     )
@@ -391,6 +441,22 @@ fn build_multimodal_message(pages: &[RenderedPage], instruction: &str) -> Result
 
     Ok(Message::User {
         content: OneOrMany::many(content).context("multimodal prompt cannot be empty")?,
+    })
+}
+
+fn build_text_page_message(pages: &[ExtractedPageText], instruction: &str) -> Result<Message> {
+    let mut content = Vec::with_capacity(1 + pages.len());
+    content.push(UserContent::text(instruction));
+
+    for page in pages {
+        content.push(UserContent::text(format!(
+            "PDF physical page {}\n---BEGIN PAGE TEXT---\n{}\n---END PAGE TEXT---",
+            page.physical_page, page.text
+        )));
+    }
+
+    Ok(Message::User {
+        content: OneOrMany::many(content).context("text prompt cannot be empty")?,
     })
 }
 

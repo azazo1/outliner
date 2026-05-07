@@ -9,7 +9,10 @@ use tempfile::TempDir;
 
 use crate::{
     llm::{TocDirectionHint, TocPageAssessmentBatch, VisionPageObservation},
-    model::{OutlineEntry, PageLabel, PageRange, PageRangeSpec, RenderedPage, TocCandidateEntry},
+    model::{
+        ExtractedPageText, OutlineEntry, PageLabel, PageRange, PageRangeSpec, RenderedPage,
+        TocCandidateEntry,
+    },
 };
 
 const DISCOVERY_SAMPLE_BUDGET: usize = 12;
@@ -174,6 +177,45 @@ impl PdfWorkspace {
             on_page(index + 1, physical_page);
         }
         Ok(rendered)
+    }
+
+    pub fn extract_page_text_with_progress<F>(
+        &self,
+        pages: &[usize],
+        mut on_page: F,
+    ) -> Result<Vec<ExtractedPageText>>
+    where
+        F: FnMut(usize, usize),
+    {
+        let mut extracted = Vec::with_capacity(pages.len());
+        for (index, &physical_page) in pages.iter().enumerate() {
+            extracted.push(ExtractedPageText {
+                physical_page,
+                text: extract_page_text(&self.pdf_path, physical_page)?,
+            });
+            on_page(index + 1, physical_page);
+        }
+        Ok(extracted)
+    }
+
+    pub fn ocr_page_text_with_progress<F>(
+        &self,
+        pages: &[usize],
+        mut on_page: F,
+    ) -> Result<Vec<ExtractedPageText>>
+    where
+        F: FnMut(usize, usize),
+    {
+        let mut extracted = Vec::with_capacity(pages.len());
+        for (index, &physical_page) in pages.iter().enumerate() {
+            let png_bytes = render_page_png_bytes(&self.pdf_path, physical_page)?;
+            extracted.push(ExtractedPageText {
+                physical_page,
+                text: ocr_png_bytes(&png_bytes, physical_page)?,
+            });
+            on_page(index + 1, physical_page);
+        }
+        Ok(extracted)
     }
 
     pub fn calibrate_entries_from_observations(
@@ -407,6 +449,53 @@ fn render_page_png_bytes(pdf_path: &Path, physical_page: usize) -> Result<Vec<u8
         .context("pdftoppm did not produce a PNG file")?;
     std::fs::read(&image_path)
         .with_context(|| format!("failed to read rendered page {}", image_path.display()))
+}
+
+fn extract_page_text(pdf_path: &Path, physical_page: usize) -> Result<String> {
+    let output = Command::new("pdftotext")
+        .arg("-f")
+        .arg(physical_page.to_string())
+        .arg("-l")
+        .arg(physical_page.to_string())
+        .arg("-layout")
+        .arg(pdf_path)
+        .arg("-")
+        .output()
+        .with_context(|| format!("failed to execute pdftotext for page {physical_page}"))?;
+
+    if !output.status.success() {
+        bail!(
+            "pdftotext failed for {}: {}",
+            pdf_path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn ocr_png_bytes(png_bytes: &[u8], physical_page: usize) -> Result<String> {
+    let temp_dir = TempDir::new().context("failed to create temporary directory for OCR")?;
+    let image_path = temp_dir.path().join(format!("page-{physical_page}.png"));
+    std::fs::write(&image_path, png_bytes)
+        .with_context(|| format!("failed to write temporary OCR image for page {physical_page}"))?;
+
+    let output = Command::new("tesseract")
+        .arg(&image_path)
+        .arg("stdout")
+        .arg("-l")
+        .arg("eng+chi_sim")
+        .output()
+        .with_context(|| format!("failed to execute tesseract for page {physical_page}"))?;
+
+    if !output.status.success() {
+        bail!(
+            "tesseract failed for page {physical_page}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(test)]
