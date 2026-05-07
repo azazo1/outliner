@@ -22,7 +22,9 @@ use crate::{
         LlmCall, LlmConfig, VisionRequestConfig, extract_toc, identify_toc_pages,
         observe_page_labels,
     },
-    model::{OutlineEntry, RunOutcome, normalize_outline_for_compare, normalize_toc_entries},
+    model::{
+        OutlineEntry, PageRange, RunOutcome, normalize_outline_for_compare, normalize_toc_entries,
+    },
     pdf_support::PdfWorkspace,
     progress::{
         finish_stage, format_path_for_tracing, format_usage_details, init_tracing, mark_complete,
@@ -143,44 +145,15 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         );
         resolved
     } else {
-        let discovery_pages = workspace.discover_toc_sample_pages(args.toc);
-        let (sample_first, sample_last) = page_window(&discovery_pages);
-        tracing::info!(
-            sample_count = discovery_pages.len(),
-            sample_first,
-            sample_last,
-            "TOC sample pages"
-        );
-        set_run_status(
+        let refined = discover_toc_range(
+            &args,
+            &workspace,
+            &llm_config,
+            vision_request_config,
             &run_span,
-            &args.input,
-            "rendering TOC samples",
-            &agent_progress.usage,
-            agent_progress.calls,
-        );
-        let discovery_render_span = start_bar(
-            "render_toc_samples",
-            discovery_pages.len() as u64,
-            format!("rendering TOC samples {}", discovery_pages.len()),
-        );
-        let discovery_rendered = workspace.render_pages_with_progress(
-            &discovery_pages,
-            |completed, physical_page| {
-                discovery_render_span.pb_set_position(completed as u64);
-                set_bar_message(
-                    &discovery_render_span,
-                    format!(
-                        "rendering sample page {physical_page} ({completed}/{})",
-                        discovery_pages.len()
-                    ),
-                );
-            },
-        )?;
-        tracing::info!(
-            rendered_pages = discovery_rendered.len(),
-            "TOC samples rendered"
-        );
-        drop(discovery_render_span);
+            &mut agent_progress,
+        )
+        .await?;
         finish_stage(
             &run_span,
             &args.input,
@@ -188,63 +161,12 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
             &agent_progress.usage,
             agent_progress.calls,
         );
-
-        set_run_status(
-            &run_span,
-            &args.input,
-            "locating TOC",
-            &agent_progress.usage,
-            agent_progress.calls,
-        );
-        let discovery_span = start_spinner(
-            "locate_toc",
-            format!(
-                "locating TOC from {} sample pages",
-                discovery_rendered.len()
-            ),
-        );
-        let discovery_message = format!(
-            "locating TOC from {} sample pages",
-            discovery_rendered.len()
-        );
-        let LlmCall {
-            data: toc_page_batch,
-            usage,
-            calls,
-        } = identify_toc_pages(
-            &llm_config,
-            vision_request_config,
-            &discovery_rendered,
-            Some(&discovery_span),
-            &discovery_message,
-        )
-        .instrument(discovery_span.clone())
-        .await?;
-        agent_progress.record(usage, calls);
-        tracing::info!(
-            sampled_pages = discovery_rendered.len(),
-            toc_found = toc_page_batch.toc_found,
-            candidate_pages = toc_page_batch
-                .assessments
-                .iter()
-                .filter(|assessment| assessment.looks_like_toc || assessment.confidence >= 2)
-                .count(),
-            usage_total_tokens = usage.total_tokens,
-            "TOC pages detected"
-        );
-        drop(discovery_span);
         finish_stage(
             &run_span,
             &args.input,
             "TOC located",
             &agent_progress.usage,
             agent_progress.calls,
-        );
-        let refined = workspace.refine_toc_range(args.toc, &toc_page_batch);
-        tracing::info!(
-            toc_start = refined.map(|range| range.start),
-            toc_end = refined.map(|range| range.end),
-            "TOC range refined"
         );
         refined
     };
@@ -632,6 +554,152 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
             usage: agent_progress.usage,
             agent_calls: agent_progress.calls,
         })
+    }
+}
+
+async fn discover_toc_range(
+    args: &AppArgs,
+    workspace: &PdfWorkspace,
+    llm_config: &LlmConfig,
+    vision_request_config: VisionRequestConfig,
+    run_span: &tracing::Span,
+    agent_progress: &mut AgentProgress,
+) -> Result<Option<PageRange>> {
+    let mut candidate_range = workspace.initial_toc_search_range(args.toc);
+    let mut last_range = None;
+
+    loop {
+        let discovery_pages = workspace.discover_toc_sample_pages_in_range(candidate_range);
+        let (sample_first, sample_last) = page_window(&discovery_pages);
+        tracing::info!(
+            search_start = candidate_range.start,
+            search_end = candidate_range.end,
+            sample_count = discovery_pages.len(),
+            sample_first,
+            sample_last,
+            "TOC sample pages"
+        );
+        set_run_status(
+            run_span,
+            &args.input,
+            format!(
+                "rendering TOC samples in pages {}..{}",
+                candidate_range.start, candidate_range.end
+            ),
+            &agent_progress.usage,
+            agent_progress.calls,
+        );
+        let discovery_render_span = start_bar(
+            "render_toc_samples",
+            discovery_pages.len() as u64,
+            format!(
+                "rendering TOC samples {}..{}",
+                candidate_range.start, candidate_range.end
+            ),
+        );
+        let discovery_rendered = workspace.render_pages_with_progress(
+            &discovery_pages,
+            |completed, physical_page| {
+                discovery_render_span.pb_set_position(completed as u64);
+                set_bar_message(
+                    &discovery_render_span,
+                    format!(
+                        "rendering sample page {physical_page} ({completed}/{})",
+                        discovery_pages.len()
+                    ),
+                );
+            },
+        )?;
+        tracing::info!(
+            rendered_pages = discovery_rendered.len(),
+            "TOC samples rendered"
+        );
+        drop(discovery_render_span);
+
+        set_run_status(
+            run_span,
+            &args.input,
+            format!(
+                "locating TOC in pages {}..{}",
+                candidate_range.start, candidate_range.end
+            ),
+            &agent_progress.usage,
+            agent_progress.calls,
+        );
+        let discovery_span = start_spinner(
+            "locate_toc",
+            format!(
+                "locating TOC in pages {}..{} from {} samples",
+                candidate_range.start,
+                candidate_range.end,
+                discovery_rendered.len()
+            ),
+        );
+        let discovery_message = format!(
+            "locating TOC in pages {}..{} from {} samples",
+            candidate_range.start,
+            candidate_range.end,
+            discovery_rendered.len()
+        );
+        let LlmCall {
+            data: toc_page_batch,
+            usage,
+            calls,
+        } = identify_toc_pages(
+            llm_config,
+            vision_request_config,
+            &discovery_rendered,
+            Some(&discovery_span),
+            &discovery_message,
+        )
+        .instrument(discovery_span.clone())
+        .await?;
+        agent_progress.record(usage, calls);
+        let hit_count = toc_page_batch
+            .assessments
+            .iter()
+            .filter(|assessment| assessment.looks_like_toc || assessment.confidence >= 2)
+            .count();
+        tracing::info!(
+            search_start = candidate_range.start,
+            search_end = candidate_range.end,
+            sampled_pages = discovery_rendered.len(),
+            toc_found = toc_page_batch.toc_found,
+            candidate_pages = hit_count,
+            usage_total_tokens = usage.total_tokens,
+            "TOC pages detected"
+        );
+        drop(discovery_span);
+
+        if hit_count > 0 {
+            let refined = workspace.refine_toc_range(args.toc, &toc_page_batch);
+            tracing::info!(
+                toc_start = refined.map(|range| range.start),
+                toc_end = refined.map(|range| range.end),
+                "TOC range refined from hits"
+            );
+            return Ok(refined);
+        }
+
+        let next_range = workspace.narrow_toc_search_range(candidate_range, &toc_page_batch);
+        tracing::info!(
+            next_start = next_range.map(|range| range.start),
+            next_end = next_range.map(|range| range.end),
+            "TOC range refined from direction hints"
+        );
+
+        let Some(next_range) = next_range else {
+            return Ok(None);
+        };
+        if last_range.is_some_and(|range| range == next_range) {
+            return Ok(None);
+        }
+        if workspace.should_render_full_toc_range(next_range) {
+            return Ok(Some(next_range));
+        }
+
+        last_range = Some(candidate_range);
+        candidate_range = next_range;
     }
 }
 

@@ -8,12 +8,13 @@ use anyhow::{Context, Result, bail};
 use tempfile::TempDir;
 
 use crate::{
-    llm::{TocPageAssessmentBatch, VisionPageObservation},
+    llm::{TocDirectionHint, TocPageAssessmentBatch, VisionPageObservation},
     model::{OutlineEntry, PageLabel, PageRange, PageRangeSpec, RenderedPage, TocCandidateEntry},
 };
 
 const DISCOVERY_SAMPLE_BUDGET: usize = 12;
 const LABEL_SAMPLE_BUDGET: usize = 14;
+const DISCOVERY_REFINE_TARGET_LEN: usize = 18;
 
 pub struct PdfWorkspace {
     pdf_path: PathBuf,
@@ -32,11 +33,13 @@ impl PdfWorkspace {
         toc.and_then(|spec| spec.resolve(self.page_count))
     }
 
-    pub fn discover_toc_sample_pages(&self, toc: Option<PageRangeSpec>) -> Vec<usize> {
-        let search_range = self
-            .resolve_toc_range(toc)
-            .unwrap_or_else(|| default_toc_search_range(self.page_count));
-        sample_pages(search_range, DISCOVERY_SAMPLE_BUDGET)
+    pub fn discover_toc_sample_pages_in_range(&self, range: PageRange) -> Vec<usize> {
+        sample_pages(range, DISCOVERY_SAMPLE_BUDGET)
+    }
+
+    pub fn initial_toc_search_range(&self, toc: Option<PageRangeSpec>) -> PageRange {
+        self.resolve_toc_range(toc)
+            .unwrap_or_else(|| default_toc_search_range(self.page_count))
     }
 
     pub fn refine_toc_range(
@@ -68,6 +71,47 @@ impl PdfWorkspace {
             min_hit.saturating_sub(padding).max(search_range.start),
             (max_hit + padding).min(search_range.end),
         )
+    }
+
+    pub fn narrow_toc_search_range(
+        &self,
+        current_range: PageRange,
+        batch: &TocPageAssessmentBatch,
+    ) -> Option<PageRange> {
+        let hits = toc_hit_pages(batch);
+        if !hits.is_empty() {
+            let min_hit = *hits.iter().min()?;
+            let max_hit = *hits.iter().max()?;
+            let padding = if max_hit > min_hit { 1 } else { 2 };
+            return PageRange::new(
+                min_hit.saturating_sub(padding).max(current_range.start),
+                (max_hit + padding).min(current_range.end),
+            );
+        }
+
+        let lower_bound = batch
+            .assessments
+            .iter()
+            .filter(|assessment| assessment.toc_direction_hint == TocDirectionHint::After)
+            .map(|assessment| assessment.physical_page.saturating_add(1))
+            .max()
+            .unwrap_or(current_range.start)
+            .max(current_range.start);
+        let upper_bound = batch
+            .assessments
+            .iter()
+            .filter(|assessment| assessment.toc_direction_hint == TocDirectionHint::Before)
+            .map(|assessment| assessment.physical_page.saturating_sub(1))
+            .min()
+            .unwrap_or(current_range.end)
+            .min(current_range.end);
+
+        PageRange::new(lower_bound, upper_bound)
+            .filter(|range| range.start != current_range.start || range.end != current_range.end)
+    }
+
+    pub fn should_render_full_toc_range(&self, range: PageRange) -> bool {
+        range.len() <= DISCOVERY_REFINE_TARGET_LEN
     }
 
     pub fn toc_pages_to_render(
@@ -197,6 +241,15 @@ fn sample_pages(range: PageRange, budget: usize) -> Vec<usize> {
     pages.sort_unstable();
     pages.dedup();
     pages
+}
+
+fn toc_hit_pages(batch: &TocPageAssessmentBatch) -> Vec<usize> {
+    batch
+        .assessments
+        .iter()
+        .filter(|assessment| assessment.looks_like_toc || assessment.confidence >= 2)
+        .map(|assessment| assessment.physical_page)
+        .collect()
 }
 
 fn observation_map(observations: &[VisionPageObservation]) -> HashMap<PageLabel, Vec<usize>> {
@@ -361,13 +414,14 @@ fn render_page_png_bytes(pdf_path: &Path, physical_page: usize) -> Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::{
-        infer_best_offsets, infer_fallback_offset, resolve_entry_page, sample_pages,
-        PageOffsets,
+        infer_best_offsets, infer_fallback_offset, resolve_entry_page, sample_pages, PageOffsets,
+        PdfWorkspace,
     };
     use crate::{
-        llm::VisionPageObservation,
+        llm::{TocDirectionHint, TocPageAssessment, TocPageAssessmentBatch, VisionPageObservation},
         model::{PageLabel, PageRange, TocCandidateEntry},
     };
+    use std::path::PathBuf;
 
     #[test]
     fn sample_pages_spreads_across_range() {
@@ -448,5 +502,60 @@ mod tests {
         );
 
         assert_eq!(page, 13);
+    }
+
+    #[test]
+    fn narrow_toc_search_range_uses_direction_hints_without_hits() {
+        let workspace = PdfWorkspace::new(PathBuf::from("book.pdf"), 120);
+        let range = PageRange::new(1, 40).expect("range");
+        let batch = TocPageAssessmentBatch {
+            toc_found: false,
+            notes: None,
+            assessments: vec![
+                TocPageAssessment {
+                    physical_page: 8,
+                    looks_like_toc: false,
+                    toc_direction_hint: TocDirectionHint::After,
+                    confidence: 1,
+                },
+                TocPageAssessment {
+                    physical_page: 30,
+                    looks_like_toc: false,
+                    toc_direction_hint: TocDirectionHint::Before,
+                    confidence: 1,
+                },
+            ],
+        };
+
+        assert_eq!(
+            workspace.narrow_toc_search_range(range, &batch),
+            PageRange::new(9, 29)
+        );
+    }
+
+    #[test]
+    fn narrow_toc_search_range_returns_none_when_direction_conflicts() {
+        let workspace = PdfWorkspace::new(PathBuf::from("book.pdf"), 120);
+        let range = PageRange::new(1, 40).expect("range");
+        let batch = TocPageAssessmentBatch {
+            toc_found: false,
+            notes: None,
+            assessments: vec![
+                TocPageAssessment {
+                    physical_page: 25,
+                    looks_like_toc: false,
+                    toc_direction_hint: TocDirectionHint::After,
+                    confidence: 1,
+                },
+                TocPageAssessment {
+                    physical_page: 20,
+                    looks_like_toc: false,
+                    toc_direction_hint: TocDirectionHint::Before,
+                    confidence: 1,
+                },
+            ],
+        };
+
+        assert_eq!(workspace.narrow_toc_search_range(range, &batch), None);
     }
 }

@@ -55,6 +55,10 @@ Rules:
 - Evaluate each page independently, then summarize the batch.
 - looks_like_toc = true only when the page itself is a table-of-contents page, or a standalone TOC heading page that directly belongs to adjacent TOC listing pages.
 - Body pages, chapter openers, references, indexes, blank separators, and running headers are not TOC pages.
+- For each page, set toc_direction_hint to:
+  - unknown when the page itself looks like TOC, or when there is not enough evidence to infer direction.
+  - before when the page strongly suggests the real TOC appears earlier in the document than this page.
+  - after when the page strongly suggests the real TOC appears later in the document than this page.
 - confidence uses 0 to 3:
   - 0 = definitely not TOC
   - 1 = weak signal
@@ -83,12 +87,22 @@ pub struct VisionRequestConfig {
     pub concurrency: usize,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TocDirectionHint {
+    Before,
+    After,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TocPageAssessment {
     #[schemars(required)]
     pub physical_page: usize,
     #[schemars(required)]
     pub looks_like_toc: bool,
+    #[schemars(required)]
+    pub toc_direction_hint: TocDirectionHint,
     #[schemars(required)]
     pub confidence: u8,
 }
