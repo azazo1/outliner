@@ -144,13 +144,20 @@ impl PdfWorkspace {
     ) -> Vec<OutlineEntry> {
         let offsets = infer_best_offsets(observations);
         let anchors = observation_map(observations);
+        let fallback_offset = infer_fallback_offset(entries, observations, self.page_count);
 
         entries
             .iter()
             .map(|entry| {
                 let page_label = crate::model::parse_page_label(&entry.page_label);
                 let physical_page =
-                    resolve_entry_page(page_label.as_ref(), offsets, &anchors, self.page_count);
+                    resolve_entry_page(
+                        page_label.as_ref(),
+                        offsets,
+                        fallback_offset,
+                        &anchors,
+                        self.page_count,
+                    );
                 OutlineEntry {
                     title: entry.title.clone(),
                     level: usize::from(entry.level),
@@ -240,6 +247,7 @@ fn infer_best_offsets(observations: &[VisionPageObservation]) -> PageOffsets {
 fn resolve_entry_page(
     label: Option<&PageLabel>,
     offsets: PageOffsets,
+    fallback_offset: Option<isize>,
     anchors: &HashMap<PageLabel, Vec<usize>>,
     page_count: usize,
 ) -> usize {
@@ -253,13 +261,38 @@ fn resolve_entry_page(
         if let (Some(number), Some(offset)) = (label.numeric_value(), offsets.for_label(label)) {
             return clamp_page(number as isize + offset, page_count);
         }
+
+        if let (Some(number), Some(offset)) = (label.numeric_value(), fallback_offset) {
+            return clamp_page(number as isize + offset, page_count);
+        }
     }
 
     offsets
         .arabic
         .or(offsets.roman)
+        .or(fallback_offset)
         .map(|value| clamp_page(value + 1, page_count))
         .unwrap_or(1)
+}
+
+fn infer_fallback_offset(
+    entries: &[TocCandidateEntry],
+    observations: &[VisionPageObservation],
+    page_count: usize,
+) -> Option<isize> {
+    if observations.is_empty() || entries.is_empty() {
+        return None;
+    }
+
+    let min_entry_label = entries.iter().filter_map(entry_label_value).min()?;
+    let first_sample_page = observations.iter().map(|item| item.physical_page).min()?;
+    let remaining_pages = page_count.saturating_sub(first_sample_page);
+
+    if min_entry_label > remaining_pages.saturating_add(1) {
+        return None;
+    }
+
+    Some(first_sample_page as isize - min_entry_label as isize)
 }
 
 fn best_offset(scores: HashMap<isize, usize>) -> Option<isize> {
@@ -327,10 +360,13 @@ fn render_page_png_bytes(pdf_path: &Path, physical_page: usize) -> Result<Vec<u8
 
 #[cfg(test)]
 mod tests {
-    use super::{infer_best_offsets, sample_pages};
+    use super::{
+        infer_best_offsets, infer_fallback_offset, resolve_entry_page, sample_pages,
+        PageOffsets,
+    };
     use crate::{
         llm::VisionPageObservation,
-        model::{PageLabel, PageRange},
+        model::{PageLabel, PageRange, TocCandidateEntry},
     };
 
     #[test]
@@ -368,5 +404,49 @@ mod tests {
             PageLabel::Roman("xii".to_string()).numeric_value(),
             Some(12)
         );
+    }
+
+    #[test]
+    fn fallback_offset_uses_first_sample_page_when_labels_are_missing() {
+        let entries = vec![
+            TocCandidateEntry {
+                title: "一、概述".to_string(),
+                level: 1,
+                page_label: "1".to_string(),
+            },
+            TocCandidateEntry {
+                title: "五、实践任务".to_string(),
+                level: 1,
+                page_label: "4".to_string(),
+            },
+        ];
+        let observations = vec![
+            VisionPageObservation {
+                physical_page: 5,
+                printed_page_label: None,
+            },
+            VisionPageObservation {
+                physical_page: 11,
+                printed_page_label: None,
+            },
+        ];
+
+        assert_eq!(infer_fallback_offset(&entries, &observations, 88), Some(4));
+    }
+
+    #[test]
+    fn resolve_entry_page_uses_fallback_offset_before_collapsing_to_page_one() {
+        let page = resolve_entry_page(
+            Some(&PageLabel::Arabic(9)),
+            PageOffsets {
+                arabic: None,
+                roman: None,
+            },
+            Some(4),
+            &std::collections::HashMap::new(),
+            88,
+        );
+
+        assert_eq!(page, 13);
     }
 }

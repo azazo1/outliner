@@ -182,12 +182,12 @@ pub fn parse_page_label(label: &str) -> Option<PageLabel> {
         return None;
     }
 
-    if let Ok(number) = trimmed.parse::<usize>() {
+    if let Some(number) = extract_arabic_page_number(trimmed) {
         return Some(PageLabel::Arabic(number));
     }
 
-    if is_roman_numeral(trimmed) {
-        return Some(PageLabel::Roman(trimmed.to_ascii_lowercase()));
+    if let Some(roman) = extract_roman_page_number(trimmed) {
+        return Some(PageLabel::Roman(roman));
     }
 
     None
@@ -205,6 +205,30 @@ impl PageLabel {
 fn is_roman_numeral(value: &str) -> bool {
     let re = Regex::new(r"(?i)^[ivxlcdm]+$").expect("roman numeral regex");
     re.is_match(value)
+}
+
+fn extract_arabic_page_number(value: &str) -> Option<usize> {
+    if let Ok(number) = value.parse::<usize>() {
+        return Some(number);
+    }
+
+    let re = Regex::new(r"(?i)^\D*(\d{1,6})\D*$").expect("arabic page label regex");
+    re.captures(value)
+        .and_then(|captures| captures.get(1))
+        .and_then(|matched| matched.as_str().parse::<usize>().ok())
+}
+
+fn extract_roman_page_number(value: &str) -> Option<String> {
+    if is_roman_numeral(value) {
+        return Some(value.to_ascii_lowercase());
+    }
+
+    let re = Regex::new(r"(?i)^[^a-z0-9]*([ivxlcdm]{1,16})[^a-z0-9]*$")
+        .expect("roman page label wrapper regex");
+    re.captures(value)
+        .and_then(|captures| captures.get(1))
+        .map(|matched| matched.as_str().to_ascii_lowercase())
+        .filter(|roman| is_roman_numeral(roman))
 }
 
 fn roman_to_number(value: &str) -> Option<usize> {
@@ -276,6 +300,24 @@ mod tests {
         assert_eq!(
             parse_page_label("XIV").expect("roman label").to_string(),
             "xiv"
+        );
+    }
+
+    #[test]
+    fn parse_page_label_supports_wrapped_arabic_digits() {
+        assert_eq!(
+            parse_page_label("- 12 -").expect("wrapped arabic label").to_string(),
+            "12"
+        );
+    }
+
+    #[test]
+    fn parse_page_label_supports_wrapped_roman_numerals() {
+        assert_eq!(
+            parse_page_label("(iv)")
+                .expect("wrapped roman label")
+                .to_string(),
+            "iv"
         );
     }
 

@@ -112,9 +112,15 @@ pub struct VisionPageObservation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct ObservedPrintedPageLabel {
+    #[schemars(required)]
+    printed_page_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct VisionPageObservationBatch {
     #[schemars(required)]
-    observations: Vec<VisionPageObservation>,
+    observations: Vec<ObservedPrintedPageLabel>,
 }
 
 pub async fn identify_toc_pages(
@@ -204,13 +210,14 @@ pub async fn observe_page_labels(
             )
         },
         merge_vision_observation_batches,
-        "You inspect PDF page images. Return observations in the same order as the input page images. For each page image, detect the visible printed page label if one is clearly present in the page header or footer. Use the exact visible label, usually digits or roman numerals. If no printed page label is visible, use null. Prefer the schema field `observations`, and each observation should use the field `printed_page_label`. Do not return physical page numbers unless explicitly needed by the schema.",
+        "You inspect PDF page images. Return one observation per input page image, in the same order as the input. For each page image, detect the visible printed page label if one is clearly present in the page header or footer. Use the exact visible label, usually digits or roman numerals. If no printed page label is visible, use null. Prefer the schema field `observations`, and each observation should use the field `printed_page_label`. Do not return physical page numbers.",
         progress_span,
         progress_label,
     )
     .await?;
+    let observations = bind_page_label_observations(pages, &response.data.observations);
     Ok(LlmCall {
-        data: response.data.observations,
+        data: observations,
         usage: response.usage,
         calls: response.calls,
     })
@@ -323,10 +330,32 @@ fn merge_vision_observation_batches(
     for batch in batches.drain(..) {
         observations.extend(batch.observations);
     }
-    observations.sort_by_key(|observation| observation.physical_page);
-    observations.dedup_by_key(|observation| observation.physical_page);
 
     Ok(VisionPageObservationBatch { observations })
+}
+
+fn bind_page_label_observations(
+    pages: &[RenderedPage],
+    observations: &[ObservedPrintedPageLabel],
+) -> Vec<VisionPageObservation> {
+    if observations.len() != pages.len() {
+        tracing::warn!(
+            expected = pages.len(),
+            observed = observations.len(),
+            "page label observation count does not match rendered pages"
+        );
+    }
+
+    pages
+        .iter()
+        .enumerate()
+        .map(|(index, page)| VisionPageObservation {
+            physical_page: page.physical_page,
+            printed_page_label: observations
+                .get(index)
+                .and_then(|observation| observation.printed_page_label.clone()),
+        })
+        .collect()
 }
 
 fn build_multimodal_message(pages: &[RenderedPage], instruction: &str) -> Result<Message> {
@@ -896,8 +925,9 @@ mod tests {
     use std::time::Instant;
 
     use super::{
-        LlmConfig, OutputWindow, RenderedPage, batch_page_range_label, build_openai_client,
-        display_width, take_prefix_width, take_suffix_width,
+        LlmConfig, ObservedPrintedPageLabel, OutputWindow, RenderedPage,
+        batch_page_range_label, bind_page_label_observations, build_openai_client, display_width,
+        take_prefix_width, take_suffix_width,
     };
     use crate::config::{CliArgs, resolve_args};
 
@@ -997,8 +1027,37 @@ mod tests {
             },
         ];
 
-        assert_eq!(batch_page_range_label(&pages), "page 12-15");
+        assert_eq!(batch_page_range_label(&pages), "page 12..15");
         assert_eq!(batch_page_range_label(&pages[..1]), "page 12");
+    }
+
+    #[test]
+    fn bind_page_label_observations_uses_rendered_page_order() {
+        let pages = vec![
+            RenderedPage {
+                physical_page: 12,
+                png_bytes: Vec::new(),
+            },
+            RenderedPage {
+                physical_page: 15,
+                png_bytes: Vec::new(),
+            },
+        ];
+        let observations = vec![
+            ObservedPrintedPageLabel {
+                printed_page_label: Some("1".to_string()),
+            },
+            ObservedPrintedPageLabel {
+                printed_page_label: Some("4".to_string()),
+            },
+        ];
+
+        let bound = bind_page_label_observations(&pages, &observations);
+
+        assert_eq!(bound[0].physical_page, 12);
+        assert_eq!(bound[0].printed_page_label.as_deref(), Some("1"));
+        assert_eq!(bound[1].physical_page, 15);
+        assert_eq!(bound[1].printed_page_label.as_deref(), Some("4"));
     }
 
     #[test]
