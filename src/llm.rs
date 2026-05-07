@@ -415,3 +415,102 @@ fn slice_chars(text: &str, start: usize, end: usize) -> String {
         .take(end.saturating_sub(start))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use anyhow::{Result, ensure};
+    use futures_util::StreamExt;
+    use rig::agent::MultiTurnStreamItem;
+    use rig::client::CompletionClient;
+    use rig::completion::Prompt;
+    use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
+    use std::path::PathBuf;
+
+    use super::{LlmConfig, build_openai_client};
+    use crate::config::{CliArgs, resolve_args};
+
+    fn load_live_test_config() -> Result<LlmConfig> {
+        let args = resolve_args(CliArgs {
+            input: PathBuf::from("live-test.pdf"),
+            output: None,
+            model: None,
+            config: None,
+            toc: None,
+        })?;
+
+        Ok(LlmConfig {
+            model: args.model,
+            api_base: args.api_base,
+            api_key: args.api_key,
+        })
+    }
+
+    #[tokio::test]
+    #[ignore = "live test: uses configured LLM API"]
+    async fn minimal_non_streaming_live_test() -> Result<()> {
+        let config = load_live_test_config()?;
+        let client = build_openai_client(&config)?;
+        let model = config
+            .model
+            .as_deref()
+            .unwrap_or(rig::providers::openai::GPT_4O_MINI);
+        let agent = client
+            .completion_model(model)
+            .completions_api()
+            .into_agent_builder()
+            .preamble("Repeat the user message exactly.")
+            .temperature(0.0)
+            .max_tokens(4)
+            .build();
+
+        let response = agent.prompt("x").await?;
+
+        ensure!(response.trim() == "x", "unexpected response: {response:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "live test: uses configured LLM API"]
+    async fn minimal_streaming_live_test() -> Result<()> {
+        let config = load_live_test_config()?;
+        let client = build_openai_client(&config)?;
+        let model = config
+            .model
+            .as_deref()
+            .unwrap_or(rig::providers::openai::GPT_4O_MINI);
+        let agent = client
+            .completion_model(model)
+            .completions_api()
+            .into_agent_builder()
+            .preamble("Repeat the user message exactly.")
+            .temperature(0.0)
+            .max_tokens(4)
+            .build();
+
+        let mut stream = agent.stream_prompt("x").await;
+        let mut streamed_text = String::new();
+        let mut final_text = String::new();
+
+        while let Some(item) = stream.next().await {
+            match item? {
+                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text)) => {
+                    streamed_text.push_str(&text.text);
+                }
+                MultiTurnStreamItem::FinalResponse(response) => {
+                    final_text = response.response().to_string();
+                }
+                _ => {}
+            }
+        }
+
+        if final_text.is_empty() {
+            final_text = streamed_text;
+        }
+
+        ensure!(
+            final_text.trim() == "x",
+            "unexpected response: {final_text:?}"
+        );
+        Ok(())
+    }
+}

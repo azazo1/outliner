@@ -39,8 +39,9 @@ pub fn init_tracing() {
             .with_target(false)
             .without_time()
             .with_filter(default_env_filter());
-        let indicatif_layer =
-            indicatif_layer.with_filter(filter_fn(|metadata| matches!(metadata.name(), "outline" | "stage")));
+        let indicatif_layer = indicatif_layer.with_filter(filter_fn(|metadata| {
+            matches!(metadata.name(), "outline" | "stage")
+        }));
 
         tracing_subscriber::registry()
             .with(fmt_layer)
@@ -131,7 +132,10 @@ pub fn set_spinner_message(
     output_chars: Option<usize>,
     output_window: Option<&str>,
 ) {
-    let mut parts = vec![format_display_message(message.as_ref(), MAX_STAGE_LABEL_LEN)];
+    let mut parts = vec![format_display_message(
+        message.as_ref(),
+        MAX_STAGE_LABEL_LEN,
+    )];
     if let Some(output_chars) = output_chars {
         parts.push(format!("chars {}", format_count(output_chars as u64)));
     }

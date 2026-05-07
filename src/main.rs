@@ -191,10 +191,15 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         );
         let discovery_span = start_spinner(
             "locate_toc",
-            format!("locating TOC from {} sample pages", discovery_rendered.len()),
+            format!(
+                "locating TOC from {} sample pages",
+                discovery_rendered.len()
+            ),
         );
-        let discovery_message =
-            format!("locating TOC from {} sample pages", discovery_rendered.len());
+        let discovery_message = format!(
+            "locating TOC from {} sample pages",
+            discovery_rendered.len()
+        );
         let LlmCall {
             data: toc_page_batch,
             usage,
@@ -315,8 +320,8 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         Some(&extract_span),
         &extract_message,
     )
-        .instrument(extract_span.clone())
-        .await?;
+    .instrument(extract_span.clone())
+    .await?;
     agent_progress.record(usage);
     tracing::info!(
         toc_found = extracted.toc_found,
@@ -431,8 +436,8 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         Some(&observe_span),
         &observe_message,
     )
-        .instrument(observe_span.clone())
-        .await?;
+    .instrument(observe_span.clone())
+    .await?;
     agent_progress.record(usage);
     tracing::info!(
         sample_count = rendered_label_pages.len(),
@@ -456,10 +461,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         &agent_progress.usage,
         agent_progress.calls,
     );
-    let calibrate_span = start_spinner(
-        "resolve_entries",
-        "matching TOC entries to PDF pages",
-    );
+    let calibrate_span = start_spinner("resolve_entries", "matching TOC entries to PDF pages");
     let calibrated = workspace.calibrate_entries_from_observations(&toc_entries, &observations);
     let calibrated = ensure_toc_heading_entry(toc_heading_page, calibrated);
     tracing::info!(
