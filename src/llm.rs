@@ -21,6 +21,7 @@ use std::{
     time::Instant,
 };
 use tracing::Span;
+use unicode_width::UnicodeWidthChar;
 
 use crate::model::{RenderedPage, TocExtraction};
 use crate::progress::{set_spinner_message, start_spinner};
@@ -215,7 +216,10 @@ pub async fn observe_page_labels(
 }
 
 fn chunk_rendered_pages(pages: &[RenderedPage], batch_size: usize) -> Vec<Vec<RenderedPage>> {
-    pages.chunks(batch_size.max(1)).map(|chunk| chunk.to_vec()).collect()
+    pages
+        .chunks(batch_size.max(1))
+        .map(|chunk| chunk.to_vec())
+        .collect()
 }
 
 #[derive(Debug)]
@@ -615,12 +619,7 @@ where
             preamble,
             prompt,
             Some(&worker_span),
-            &worker_batch_label(
-                &progress_label,
-                worker_index,
-                worker_count,
-                &page_range_label,
-            ),
+            &worker_batch_label(worker_index, worker_count, &page_range_label),
         )
         .await?;
 
@@ -709,14 +708,9 @@ fn worker_done_label(progress_label: &str, worker_index: usize, worker_count: us
     )
 }
 
-fn worker_batch_label(
-    progress_label: &str,
-    worker_index: usize,
-    worker_count: usize,
-    page_range_label: &str,
-) -> String {
+fn worker_batch_label(worker_index: usize, worker_count: usize, page_range_label: &str) -> String {
     format!(
-        "{progress_label} | worker {}/{} | {page_range_label}",
+        "{page_range_label} | worker {}/{}",
         worker_index + 1,
         worker_count,
     )
@@ -724,23 +718,23 @@ fn worker_batch_label(
 
 fn batch_page_range_label(pages: &[RenderedPage]) -> String {
     let Some(first) = pages.first().map(|page| page.physical_page) else {
-        return "pages ?".to_string();
+        return "page ?".to_string();
     };
     let last = pages.last().map(|page| page.physical_page).unwrap_or(first);
     if first == last {
         format!("page {first}")
     } else {
-        format!("pages {first}-{last}")
+        format!("page {first}..{last}")
     }
 }
 
 struct OutputWindow {
     full_text: String,
-    total_chars: usize,
-    visible_start_chars: usize,
+    total_width: usize,
+    visible_start_width: usize,
     window_len: usize,
     max_scroll_chars_per_second: f64,
-    scroll_credit_chars: f64,
+    scroll_credit_width: f64,
     last_update: Instant,
 }
 
@@ -748,55 +742,46 @@ impl OutputWindow {
     fn new(window_len: usize, max_scroll_chars_per_second: f64) -> Self {
         Self {
             full_text: String::new(),
-            total_chars: 0,
-            visible_start_chars: 0,
+            total_width: 0,
+            visible_start_width: 0,
             window_len,
             max_scroll_chars_per_second,
-            scroll_credit_chars: 0.0,
+            scroll_credit_width: 0.0,
             last_update: Instant::now(),
         }
     }
 
     fn push_str(&mut self, text: &str) {
         self.full_text.push_str(text);
-        self.total_chars += text.chars().count();
+        self.total_width += display_width(text);
         self.advance_visible_window();
     }
 
     fn finish(&mut self, final_text: &str) {
         self.full_text.clear();
         self.full_text.push_str(final_text);
-        self.total_chars = final_text.chars().count();
-        self.visible_start_chars = self.total_chars.saturating_sub(self.window_len);
-        self.scroll_credit_chars = 0.0;
+        self.total_width = display_width(final_text);
+        self.visible_start_width = self.total_width.saturating_sub(self.window_len);
+        self.scroll_credit_width = 0.0;
         self.last_update = Instant::now();
     }
 
     fn render(&self) -> String {
-        if self.total_chars == 0 {
+        if self.total_width == 0 {
             return String::new();
         }
 
-        let visible_end_chars = self
-            .visible_start_chars
+        let visible_end_width = self
+            .visible_start_width
             .saturating_add(self.window_len)
-            .min(self.total_chars);
-        let window = slice_chars(&self.full_text, self.visible_start_chars, visible_end_chars);
-
-        match (
-            self.visible_start_chars > 0,
-            visible_end_chars < self.total_chars,
-        ) {
-            (true, true) => format!("...{window}..."),
-            (true, false) => format!("...{window}"),
-            (false, true) => format!("{window}..."),
-            (false, false) => window,
-        }
+            .min(self.total_width);
+        let visible_prefix = take_prefix_width(&self.full_text, visible_end_width);
+        take_suffix_width(&visible_prefix, self.window_len)
     }
 
     fn advance_visible_window(&mut self) {
-        if self.total_chars <= self.window_len {
-            self.visible_start_chars = 0;
+        if self.total_width <= self.window_len {
+            self.visible_start_width = 0;
             self.last_update = Instant::now();
             return;
         }
@@ -804,21 +789,54 @@ impl OutputWindow {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update).as_secs_f64();
         self.last_update = now;
-        self.scroll_credit_chars += elapsed * self.max_scroll_chars_per_second;
+        self.scroll_credit_width += elapsed * self.max_scroll_chars_per_second;
 
-        let desired_start = self.total_chars.saturating_sub(self.window_len);
-        let max_advance = self.scroll_credit_chars.floor() as usize;
-        let advance = max_advance.min(desired_start.saturating_sub(self.visible_start_chars));
-        self.visible_start_chars += advance;
-        self.scroll_credit_chars -= advance as f64;
+        let desired_start = self.total_width.saturating_sub(self.window_len);
+        let max_advance = self.scroll_credit_width.floor() as usize;
+        let advance = max_advance.min(desired_start.saturating_sub(self.visible_start_width));
+        self.visible_start_width += advance;
+        self.scroll_credit_width -= advance as f64;
     }
 }
 
-fn slice_chars(text: &str, start: usize, end: usize) -> String {
-    text.chars()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .collect()
+fn display_width(text: &str) -> usize {
+    text.chars().map(char_display_width).sum()
+}
+
+fn char_display_width(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
+fn take_prefix_width(text: &str, max_width: usize) -> String {
+    let mut width = 0usize;
+    let mut out = String::new();
+
+    for ch in text.chars() {
+        let ch_width = char_display_width(ch);
+        if width + ch_width > max_width {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+
+    out
+}
+
+fn take_suffix_width(text: &str, max_width: usize) -> String {
+    let mut width = 0usize;
+    let mut chars = Vec::new();
+
+    for ch in text.chars().rev() {
+        let ch_width = char_display_width(ch);
+        if width + ch_width > max_width {
+            break;
+        }
+        chars.push(ch);
+        width += ch_width;
+    }
+
+    chars.into_iter().rev().collect()
 }
 
 #[cfg(test)]
@@ -830,8 +848,12 @@ mod tests {
     use rig::completion::Prompt;
     use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
     use std::path::PathBuf;
+    use std::time::Instant;
 
-    use super::{LlmConfig, RenderedPage, batch_page_range_label, build_openai_client};
+    use super::{
+        LlmConfig, OutputWindow, RenderedPage, batch_page_range_label, build_openai_client,
+        display_width, take_prefix_width, take_suffix_width,
+    };
     use crate::config::{CliArgs, resolve_args};
 
     fn load_live_test_config() -> Result<LlmConfig> {
@@ -930,10 +952,37 @@ mod tests {
             },
         ];
 
-        assert_eq!(batch_page_range_label(&pages), "pages 12-15");
-        assert_eq!(
-            batch_page_range_label(&pages[..1]),
-            "page 12"
-        );
+        assert_eq!(batch_page_range_label(&pages), "page 12-15");
+        assert_eq!(batch_page_range_label(&pages[..1]), "page 12");
+    }
+
+    #[test]
+    fn width_helpers_respect_full_width_chars() {
+        assert_eq!(take_prefix_width("ab你好cd", 5), "ab你");
+        assert_eq!(take_suffix_width("ab你好cd", 4), "好cd");
+    }
+
+    #[test]
+    fn output_window_render_stays_within_window_width() {
+        let window = OutputWindow {
+            full_text: "ab你好cd".to_string(),
+            total_width: display_width("ab你好cd"),
+            visible_start_width: 2,
+            window_len: 4,
+            max_scroll_chars_per_second: 1_000.0,
+            scroll_credit_width: 0.0,
+            last_update: Instant::now(),
+        };
+
+        assert_eq!(window.render(), "你好");
+        assert_eq!(display_width(&window.render()), 4);
+    }
+
+    #[test]
+    fn output_window_finish_shows_last_window() {
+        let mut window = OutputWindow::new(4, 1_000.0);
+        window.finish("ab你好");
+        assert_eq!(window.render(), "你好");
+        assert_eq!(display_width(&window.render()), 4);
     }
 }

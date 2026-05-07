@@ -317,9 +317,15 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     );
     let extract_span = start_spinner(
         "extract_toc",
-        format!("extracting TOC from {} pages", rendered_toc_pages.len()),
+        format!(
+            "extracting TOC from {}",
+            format_rendered_page_range(&rendered_toc_pages)
+        ),
     );
-    let extract_message = format!("extracting TOC from {} pages", rendered_toc_pages.len());
+    let extract_message = format!(
+        "extracting TOC from {}",
+        format_rendered_page_range(&rendered_toc_pages)
+    );
     let LlmCall {
         data: extracted,
         usage,
@@ -646,6 +652,18 @@ fn page_window(pages: &[usize]) -> (Option<usize>, Option<usize>) {
     (pages.first().copied(), pages.last().copied())
 }
 
+fn format_rendered_page_range(pages: &[crate::model::RenderedPage]) -> String {
+    let Some(first) = pages.first().map(|page| page.physical_page) else {
+        return "page ?".to_string();
+    };
+    let last = pages.last().map(|page| page.physical_page).unwrap_or(first);
+    if first == last {
+        format!("page {first}")
+    } else {
+        format!("page {first}..{last}")
+    }
+}
+
 fn determine_output_path(input: &Path, output: Option<&Path>) -> PathBuf {
     output.map(Path::to_path_buf).unwrap_or_else(|| {
         let (Some(stem), Some(ext)) = (input.file_stem(), input.extension()) else {
@@ -719,10 +737,13 @@ fn is_toc_heading_title(title: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_toc_heading_entry, is_toc_heading_title, stage_count_for};
+    use super::{
+        ensure_toc_heading_entry, format_rendered_page_range, is_toc_heading_title,
+        stage_count_for,
+    };
     use crate::{
         config::AppArgs,
-        model::{OutlineEntry, PageRangeSpec},
+        model::{OutlineEntry, PageRangeSpec, RenderedPage},
     };
     use std::path::PathBuf;
 
@@ -790,5 +811,22 @@ mod tests {
             vision_workers: 4,
         };
         assert_eq!(stage_count_for(&args), 8);
+    }
+
+    #[test]
+    fn rendered_page_range_uses_double_dot_syntax() {
+        let pages = vec![
+            RenderedPage {
+                physical_page: 12,
+                png_bytes: Vec::new(),
+            },
+            RenderedPage {
+                physical_page: 15,
+                png_bytes: Vec::new(),
+            },
+        ];
+
+        assert_eq!(format_rendered_page_range(&pages), "page 12..15");
+        assert_eq!(format_rendered_page_range(&pages[..1]), "page 12");
     }
 }
