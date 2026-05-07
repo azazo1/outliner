@@ -13,7 +13,7 @@ use tracing_indicatif::{IndicatifLayer, writer::get_indicatif_stdout_writer};
 use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Layer};
+use tracing_subscriber::{EnvFilter, Layer, filter::Targets};
 use unicode_width::UnicodeWidthChar;
 
 static TRACING_INIT: Once = Once::new();
@@ -36,7 +36,8 @@ pub fn init_tracing() {
             .with_writer(indicatif_writer)
             .with_target(false)
             .without_time()
-            .with_filter(default_env_filter());
+            .with_filter(default_env_filter())
+            .with_filter(rig_trace_filter());
         let indicatif_layer = indicatif_layer.with_filter(filter_fn(|metadata| {
             matches!(metadata.name(), "outline" | "stage")
         }));
@@ -174,6 +175,16 @@ pub fn _unused_result(_: Result<()>) {}
 
 fn default_env_filter() -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER))
+}
+
+fn rig_trace_filter() -> Targets {
+    Targets::new()
+        .with_target("rig", tracing::level_filters::LevelFilter::OFF)
+        .with_target("rig_core", tracing::level_filters::LevelFilter::OFF)
+        .with_target(
+            "rig::agent::prompt_request::streaming",
+            tracing::level_filters::LevelFilter::OFF,
+        )
 }
 
 fn display_path(path: &Path, max_len: usize) -> String {

@@ -776,6 +776,7 @@ struct OutputWindow {
     window_len: usize,
     max_scroll_chars_per_second: f64,
     scroll_credit_width: f64,
+    pending_whitespace: bool,
     last_update: Instant,
 }
 
@@ -788,20 +789,21 @@ impl OutputWindow {
             window_len,
             max_scroll_chars_per_second,
             scroll_credit_width: 0.0,
+            pending_whitespace: false,
             last_update: Instant::now(),
         }
     }
 
     fn push_str(&mut self, text: &str) {
-        self.full_text.push_str(text);
-        self.total_width += display_width(text);
+        self.push_inline_text(text);
         self.advance_visible_window();
     }
 
     fn finish(&mut self, final_text: &str) {
         self.full_text.clear();
-        self.full_text.push_str(final_text);
-        self.total_width = display_width(final_text);
+        self.total_width = 0;
+        self.pending_whitespace = false;
+        self.push_inline_text(final_text);
         self.visible_start_width = self.total_width.saturating_sub(self.window_len);
         self.scroll_credit_width = 0.0;
         self.last_update = Instant::now();
@@ -838,8 +840,27 @@ impl OutputWindow {
         self.visible_start_width += advance;
         self.scroll_credit_width -= advance as f64;
     }
+
+    fn push_inline_text(&mut self, text: &str) {
+        for ch in text.chars() {
+            if ch.is_whitespace() {
+                self.pending_whitespace |= !self.full_text.is_empty();
+                continue;
+            }
+
+            if self.pending_whitespace && !self.full_text.is_empty() {
+                self.full_text.push(' ');
+                self.total_width += 1;
+                self.pending_whitespace = false;
+            }
+
+            self.full_text.push(ch);
+            self.total_width += char_display_width(ch);
+        }
+    }
 }
 
+#[cfg(test)]
 fn display_width(text: &str) -> usize {
     text.chars().map(char_display_width).sum()
 }
@@ -1075,6 +1096,7 @@ mod tests {
             window_len: 4,
             max_scroll_chars_per_second: 1_000.0,
             scroll_credit_width: 0.0,
+            pending_whitespace: false,
             last_update: Instant::now(),
         };
 
@@ -1088,5 +1110,15 @@ mod tests {
         window.finish("ab你好");
         assert_eq!(window.render(), "你好");
         assert_eq!(display_width(&window.render()), 4);
+    }
+
+    #[test]
+    fn output_window_inlines_whitespace_before_windowing() {
+        let mut window = OutputWindow::new(5, 1_000.0);
+        window.finish("ab\ncd\tef");
+
+        assert_eq!(window.full_text, "ab cd ef");
+        assert_eq!(window.render(), "cd ef");
+        assert_eq!(display_width(&window.render()), 5);
     }
 }
