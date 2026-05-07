@@ -10,8 +10,8 @@ use serde::Deserialize;
 use crate::model::PageRangeSpec;
 
 const DEFAULT_CONFIG_PATH: &str = "~/.config/outliner/config.toml";
-pub const DEFAULT_VISION_BATCH_SIZE: usize = 4;
-pub const DEFAULT_VISION_CONCURRENCY: usize = 4;
+pub const DEFAULT_VISION_WORKER_BATCH_SIZE: usize = 4;
+pub const DEFAULT_VISION_WORKERS: usize = 4;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -31,17 +31,17 @@ pub struct CliArgs {
     #[arg(long)]
     pub toc: Option<String>,
     #[arg(
-        long,
+        long = "vision-worker-batch-size",
         value_name = "N",
-        help = "Number of page images to send in each vision request"
+        help = "Number of page images each vision worker should process per batch"
     )]
-    pub vision_batch_size: Option<usize>,
+    pub vision_worker_batch_size: Option<usize>,
     #[arg(
-        long,
+        long = "vision-workers",
         value_name = "N",
-        help = "Maximum number of concurrent vision requests"
+        help = "Number of concurrent vision workers"
     )]
-    pub vision_concurrency: Option<usize>,
+    pub vision_workers: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,8 +52,8 @@ pub struct AppArgs {
     pub api_base: Option<String>,
     pub api_key: Option<String>,
     pub toc: Option<PageRangeSpec>,
-    pub vision_batch_size: usize,
-    pub vision_concurrency: usize,
+    pub vision_worker_batch_size: usize,
+    pub vision_workers: usize,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -62,8 +62,8 @@ struct FileConfig {
     model: Option<String>,
     api_base: Option<String>,
     api_key: Option<String>,
-    vision_batch_size: Option<usize>,
-    vision_concurrency: Option<usize>,
+    vision_worker_batch_size: Option<usize>,
+    vision_workers: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,15 +120,15 @@ fn merge_args(cli: CliArgs, file: FileConfig) -> Result<AppArgs> {
         model,
         config: _,
         toc,
-        vision_batch_size,
-        vision_concurrency,
+        vision_worker_batch_size,
+        vision_workers,
     } = cli;
     let FileConfig {
         model: file_model,
         api_base,
         api_key,
-        vision_batch_size: file_vision_batch_size,
-        vision_concurrency: file_vision_concurrency,
+        vision_worker_batch_size: file_vision_worker_batch_size,
+        vision_workers: file_vision_workers,
     } = file;
 
     Ok(AppArgs {
@@ -138,15 +138,15 @@ fn merge_args(cli: CliArgs, file: FileConfig) -> Result<AppArgs> {
         api_base: normalize_optional_string(api_base),
         api_key: normalize_optional_string(api_key),
         toc: toc.map(|value| parse_toc_range(&value)).transpose()?,
-        vision_batch_size: normalize_positive_usize(
-            vision_batch_size.or(file_vision_batch_size),
-            DEFAULT_VISION_BATCH_SIZE,
-            "vision_batch_size",
+        vision_worker_batch_size: normalize_positive_usize(
+            vision_worker_batch_size.or(file_vision_worker_batch_size),
+            DEFAULT_VISION_WORKER_BATCH_SIZE,
+            "vision_worker_batch_size",
         )?,
-        vision_concurrency: normalize_positive_usize(
-            vision_concurrency.or(file_vision_concurrency),
-            DEFAULT_VISION_CONCURRENCY,
-            "vision_concurrency",
+        vision_workers: normalize_positive_usize(
+            vision_workers.or(file_vision_workers),
+            DEFAULT_VISION_WORKERS,
+            "vision_workers",
         )?,
     })
 }
@@ -211,8 +211,8 @@ fn parse_positive_page(value: &str, raw: &str) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppArgs, CliArgs, DEFAULT_VISION_BATCH_SIZE, DEFAULT_VISION_CONCURRENCY, FileConfig,
-        expand_path, merge_args, parse_toc_range,
+        AppArgs, CliArgs, DEFAULT_VISION_WORKER_BATCH_SIZE, DEFAULT_VISION_WORKERS,
+        FileConfig, expand_path, merge_args, parse_toc_range,
     };
     use crate::model::PageRangeSpec;
     use std::path::{Path, PathBuf};
@@ -225,15 +225,15 @@ mod tests {
             model: Some("gpt-4.1-mini".to_string()),
             config: None,
             toc: Some("4..9".to_string()),
-            vision_batch_size: Some(2),
-            vision_concurrency: Some(3),
+            vision_worker_batch_size: Some(2),
+            vision_workers: Some(3),
         };
         let file = FileConfig {
             model: Some("gpt-4o-mini".to_string()),
             api_base: Some("https://example.com/v1".to_string()),
             api_key: Some("file-key".to_string()),
-            vision_batch_size: Some(7),
-            vision_concurrency: Some(9),
+            vision_worker_batch_size: Some(7),
+            vision_workers: Some(9),
         };
 
         let resolved = merge_args(cli, file).expect("args should resolve");
@@ -250,8 +250,8 @@ mod tests {
                     start: Some(4),
                     end: Some(9)
                 }),
-                vision_batch_size: 2,
-                vision_concurrency: 3,
+                vision_worker_batch_size: 2,
+                vision_workers: 3,
             }
         );
     }
@@ -264,8 +264,8 @@ mod tests {
             model: None,
             config: None,
             toc: None,
-            vision_batch_size: None,
-            vision_concurrency: None,
+            vision_worker_batch_size: None,
+            vision_workers: None,
         };
 
         let resolved = merge_args(cli, FileConfig::default()).expect("args should resolve");
@@ -279,8 +279,8 @@ mod tests {
                 api_base: None,
                 api_key: None,
                 toc: None,
-                vision_batch_size: DEFAULT_VISION_BATCH_SIZE,
-                vision_concurrency: DEFAULT_VISION_CONCURRENCY,
+                vision_worker_batch_size: DEFAULT_VISION_WORKER_BATCH_SIZE,
+                vision_workers: DEFAULT_VISION_WORKERS,
             }
         );
     }
@@ -302,16 +302,16 @@ mod tests {
             r#"
             api_base = "https://example.com/v1"
             api_key = "secret"
-            vision_batch_size = 2
-            vision_concurrency = 5
+            vision_worker_batch_size = 2
+            vision_workers = 5
             "#,
         )
         .expect("api config should parse");
 
         assert_eq!(file.api_base.as_deref(), Some("https://example.com/v1"));
         assert_eq!(file.api_key.as_deref(), Some("secret"));
-        assert_eq!(file.vision_batch_size, Some(2));
-        assert_eq!(file.vision_concurrency, Some(5));
+        assert_eq!(file.vision_worker_batch_size, Some(2));
+        assert_eq!(file.vision_workers, Some(5));
     }
 
     #[test]

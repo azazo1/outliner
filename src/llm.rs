@@ -609,6 +609,7 @@ where
         };
 
         let prompt = build_prompt(&batch.pages)?;
+        let page_range_label = batch_page_range_label(&batch.pages);
         let response = stream_structured_output::<T>(
             config,
             preamble,
@@ -618,9 +619,7 @@ where
                 &progress_label,
                 worker_index,
                 worker_count,
-                batch.index,
-                total_batches,
-                batch.pages.len(),
+                &page_range_label,
             ),
         )
         .await?;
@@ -714,18 +713,25 @@ fn worker_batch_label(
     progress_label: &str,
     worker_index: usize,
     worker_count: usize,
-    batch_index: usize,
-    total_batches: usize,
-    page_count: usize,
+    page_range_label: &str,
 ) -> String {
     format!(
-        "{progress_label} | worker {}/{} | batch {}/{} | pages {}",
+        "{progress_label} | worker {}/{} | {page_range_label}",
         worker_index + 1,
         worker_count,
-        batch_index + 1,
-        total_batches,
-        page_count
     )
+}
+
+fn batch_page_range_label(pages: &[RenderedPage]) -> String {
+    let Some(first) = pages.first().map(|page| page.physical_page) else {
+        return "pages ?".to_string();
+    };
+    let last = pages.last().map(|page| page.physical_page).unwrap_or(first);
+    if first == last {
+        format!("page {first}")
+    } else {
+        format!("pages {first}-{last}")
+    }
 }
 
 struct OutputWindow {
@@ -825,7 +831,7 @@ mod tests {
     use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
     use std::path::PathBuf;
 
-    use super::{LlmConfig, build_openai_client};
+    use super::{LlmConfig, RenderedPage, batch_page_range_label, build_openai_client};
     use crate::config::{CliArgs, resolve_args};
 
     fn load_live_test_config() -> Result<LlmConfig> {
@@ -835,8 +841,8 @@ mod tests {
             model: None,
             config: None,
             toc: None,
-            vision_batch_size: None,
-            vision_concurrency: None,
+            vision_worker_batch_size: None,
+            vision_workers: None,
         })?;
 
         Ok(LlmConfig {
@@ -909,5 +915,25 @@ mod tests {
             "unexpected response: {final_text:?}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn batch_label_uses_page_range() {
+        let pages = vec![
+            RenderedPage {
+                physical_page: 12,
+                png_bytes: Vec::new(),
+            },
+            RenderedPage {
+                physical_page: 15,
+                png_bytes: Vec::new(),
+            },
+        ];
+
+        assert_eq!(batch_page_range_label(&pages), "pages 12-15");
+        assert_eq!(
+            batch_page_range_label(&pages[..1]),
+            "page 12"
+        );
     }
 }

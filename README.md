@@ -44,8 +44,8 @@ RUSTC_WRAPPER= cargo build
 model = "gpt-4o-mini"
 api_base = "https://api.openai.com/v1"
 api_key = "sk-..."
-vision_batch_size = 4
-vision_concurrency = 4
+vision_worker_batch_size = 4
+vision_workers = 4
 ```
 
 如果不写配置文件, 也可以只设置环境变量:
@@ -75,7 +75,7 @@ outliner ./book.pdf --output ./book.outlined.pdf
 按批次并行处理图片:
 
 ```bash
-outliner ./book.pdf --vision-batch-size 2 --vision-concurrency 4
+outliner ./book.pdf --vision-worker-batch-size 2 --vision-workers 4
 ```
 
 限定目录页搜索范围:
@@ -107,8 +107,8 @@ outliner [OPTIONS] <INPUT>
 - `--model <MODEL>`: 覆盖配置文件中的模型名
 - `--config <PATH>`: 指定配置文件路径, 默认是 `~/.config/outliner/config.toml`
 - `--toc <RANGE>`: 指定目录页搜索或处理范围
-- `--vision-batch-size <N>`: 每个视觉请求最多携带多少张图片, 默认 `4`
-- `--vision-concurrency <N>`: 同时运行多少个视觉请求 worker, 默认 `4`
+- `--vision-worker-batch-size <N>`: 每个 worker 每批读取多少张图片, 默认 `4`
+- `--vision-workers <N>`: worker 并发数量, 默认 `4`
 
 ## 项目原理
 
@@ -131,7 +131,7 @@ outliner [OPTIONS] <INPUT>
 - 一次调用用于从目录页中提取条目, 层级和页码
 - 一次调用用于读取正文样本页上可见的印刷页码
 
-图片不会默认一次性全部送进一个请求. 程序会先按 `vision_batch_size` 分批, 再按 `vision_concurrency` 并行执行. 每个并发 worker 都会显示独立的子进度条.
+图片不会默认一次性全部送进一个请求. 程序会先按 `vision_worker_batch_size` 分批, 再按 `vision_workers` 并行执行. 每个 worker 都会显示独立的子进度条.
 
 程序并不让模型直接猜测整本书结构, 而是让模型做 3 个更窄的任务:
 

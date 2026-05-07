@@ -130,8 +130,8 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         api_key: args.api_key.clone(),
     };
     let vision_request_config = VisionRequestConfig {
-        batch_size: args.vision_batch_size,
-        concurrency: args.vision_concurrency,
+        batch_size: args.vision_worker_batch_size,
+        concurrency: args.vision_workers,
     };
 
     let refined_toc_range = if args.toc.is_some_and(|spec| spec.is_fully_bounded()) {
@@ -786,8 +786,8 @@ mod tests {
                 start: Some(3),
                 end: Some(7),
             }),
-            vision_batch_size: 4,
-            vision_concurrency: 4,
+            vision_worker_batch_size: 4,
+            vision_workers: 4,
         };
         assert_eq!(stage_count_for(&args), 8);
     }
