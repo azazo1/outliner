@@ -158,7 +158,11 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
     })
 }
 
-fn normalize_positive_usize(value: Option<usize>, default: usize, field_name: &str) -> Result<usize> {
+fn normalize_positive_usize(
+    value: Option<usize>,
+    default: usize,
+    field_name: &str,
+) -> Result<usize> {
     match value {
         Some(0) => bail!("{field_name} must be >= 1"),
         Some(value) => Ok(value),
@@ -211,8 +215,8 @@ fn parse_positive_page(value: &str, raw: &str) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppArgs, CliArgs, DEFAULT_VISION_WORKER_BATCH_SIZE, DEFAULT_VISION_WORKERS,
-        FileConfig, expand_path, merge_args, parse_toc_range,
+        AppArgs, CliArgs, DEFAULT_VISION_WORKER_BATCH_SIZE, DEFAULT_VISION_WORKERS, FileConfig,
+        expand_path, merge_args, parse_toc_range,
     };
     use crate::model::PageRangeSpec;
     use std::path::{Path, PathBuf};

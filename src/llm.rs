@@ -9,9 +9,9 @@ use rig::completion::{TypedPrompt, Usage};
 use rig::extractor::ExtractionResponse;
 use rig::message::{Image, ImageDetail, ImageMediaType, Message, UserContent};
 use rig::providers::openai;
-use schemars::schema_for;
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 use schemars::JsonSchema;
+use schemars::schema_for;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -1070,11 +1070,17 @@ mod tests {
         let config = load_live_test_config()?;
         let case = load_live_toc_direction_case()?;
         let pdf = open_pdf(&case.pdf_path)?;
-        let page_count = pdf
-            .get_num_pages()
-            .with_context(|| format!("failed to read PDF page count for {}", case.pdf_path.display()))?
-            as usize;
-        ensure!(page_count > 0, "PDF has no pages: {}", case.pdf_path.display());
+        let page_count = pdf.get_num_pages().with_context(|| {
+            format!(
+                "failed to read PDF page count for {}",
+                case.pdf_path.display()
+            )
+        })? as usize;
+        ensure!(
+            page_count > 0,
+            "PDF has no pages: {}",
+            case.pdf_path.display()
+        );
         for &page in &case.pages {
             ensure!(
                 (1..=page_count).contains(&page),
@@ -1266,9 +1272,7 @@ mod tests {
             "before" => Ok(TocDirectionHint::Before),
             "after" => Ok(TocDirectionHint::After),
             "unknown" => Ok(TocDirectionHint::Unknown),
-            _ => anyhow::bail!(
-                "invalid direction `{value}`, expected before, after, or unknown"
-            ),
+            _ => anyhow::bail!("invalid direction `{value}`, expected before, after, or unknown"),
         }
     }
 }

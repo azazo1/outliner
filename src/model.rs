@@ -306,7 +306,9 @@ mod tests {
     #[test]
     fn parse_page_label_supports_wrapped_arabic_digits() {
         assert_eq!(
-            parse_page_label("- 12 -").expect("wrapped arabic label").to_string(),
+            parse_page_label("- 12 -")
+                .expect("wrapped arabic label")
+                .to_string(),
             "12"
         );
     }

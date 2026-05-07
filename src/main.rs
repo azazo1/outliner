@@ -806,8 +806,7 @@ fn is_toc_heading_title(title: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_toc_heading_entry, format_rendered_page_range, is_toc_heading_title,
-        stage_count_for,
+        ensure_toc_heading_entry, format_rendered_page_range, is_toc_heading_title, stage_count_for,
     };
     use crate::{
         config::AppArgs,

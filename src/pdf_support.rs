@@ -194,14 +194,13 @@ impl PdfWorkspace {
             .iter()
             .map(|entry| {
                 let page_label = crate::model::parse_page_label(&entry.page_label);
-                let physical_page =
-                    resolve_entry_page(
-                        page_label.as_ref(),
-                        offsets,
-                        fallback_offset,
-                        &anchors,
-                        self.page_count,
-                    );
+                let physical_page = resolve_entry_page(
+                    page_label.as_ref(),
+                    offsets,
+                    fallback_offset,
+                    &anchors,
+                    self.page_count,
+                );
                 OutlineEntry {
                     title: entry.title.clone(),
                     level: usize::from(entry.level),
@@ -414,8 +413,8 @@ fn render_page_png_bytes(pdf_path: &Path, physical_page: usize) -> Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::{
-        infer_best_offsets, infer_fallback_offset, resolve_entry_page, sample_pages, PageOffsets,
-        PdfWorkspace,
+        PageOffsets, PdfWorkspace, infer_best_offsets, infer_fallback_offset, resolve_entry_page,
+        sample_pages,
     };
     use crate::{
         llm::{TocDirectionHint, TocPageAssessment, TocPageAssessmentBatch, VisionPageObservation},
