@@ -950,21 +950,36 @@ where
 
 #[cfg(test)]
 mod tests {
-    use anyhow::{Result, ensure};
+    use anyhow::{Context, Result, ensure};
     use futures_util::StreamExt;
     use rig::agent::MultiTurnStreamItem;
     use rig::client::CompletionClient;
     use rig::completion::Prompt;
     use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Instant;
 
     use super::{
-        LlmConfig, ObservedPrintedPageLabel, OutputWindow, RenderedPage,
-        batch_page_range_label, bind_page_label_observations, build_openai_client, display_width,
-        take_prefix_width, take_suffix_width,
+        LlmConfig, ObservedPrintedPageLabel, OutputWindow, RenderedPage, TocDirectionHint,
+        VisionRequestConfig, batch_page_range_label, bind_page_label_observations,
+        build_openai_client, display_width, identify_toc_pages, take_prefix_width,
+        take_suffix_width,
     };
     use crate::config::{CliArgs, resolve_args};
+    use crate::pdf_support::PdfWorkspace;
+    use crate::qpdf_outline::open_pdf;
+
+    const TOC_DIRECTION_TEST_PDF_ENV: &str = "OUTLINER_TOC_DIRECTION_TEST_PDF";
+    const TOC_DIRECTION_TEST_PAGES_ENV: &str = "OUTLINER_TOC_DIRECTION_TEST_PAGES";
+    const TOC_DIRECTION_TEST_EXPECTED_ENV: &str = "OUTLINER_TOC_DIRECTION_TEST_EXPECTED";
+
+    #[derive(Debug)]
+    struct LiveTocDirectionCase {
+        pdf_path: PathBuf,
+        pages: Vec<usize>,
+        expected_directions: Vec<TocDirectionHint>,
+    }
 
     fn load_live_test_config() -> Result<LlmConfig> {
         let args = resolve_args(CliArgs {
@@ -1045,6 +1060,67 @@ mod tests {
         ensure!(
             final_text.trim() == "x",
             "unexpected response: {final_text:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "live test: uses configured LLM API and an external PDF path"]
+    async fn toc_direction_live_test_on_specific_pdf_pages() -> Result<()> {
+        let config = load_live_test_config()?;
+        let case = load_live_toc_direction_case()?;
+        let pdf = open_pdf(&case.pdf_path)?;
+        let page_count = pdf
+            .get_num_pages()
+            .with_context(|| format!("failed to read PDF page count for {}", case.pdf_path.display()))?
+            as usize;
+        ensure!(page_count > 0, "PDF has no pages: {}", case.pdf_path.display());
+        for &page in &case.pages {
+            ensure!(
+                (1..=page_count).contains(&page),
+                "page {page} is out of range for {} pages in {}",
+                page_count,
+                case.pdf_path.display()
+            );
+        }
+
+        let workspace = PdfWorkspace::new(case.pdf_path.clone(), page_count);
+        let rendered_pages = workspace.render_pages_with_progress(&case.pages, |_, _| {})?;
+        let response = identify_toc_pages(
+            &config,
+            VisionRequestConfig {
+                batch_size: rendered_pages.len().max(1),
+                concurrency: 1,
+            },
+            &rendered_pages,
+            None,
+            "live TOC direction test",
+        )
+        .await?;
+        let actual_by_page = response
+            .data
+            .assessments
+            .into_iter()
+            .map(|assessment| (assessment.physical_page, assessment.toc_direction_hint))
+            .collect::<BTreeMap<_, _>>();
+        let actual_directions = case
+            .pages
+            .iter()
+            .map(|page| {
+                actual_by_page
+                    .get(page)
+                    .copied()
+                    .with_context(|| format!("agent response missed page {page}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        ensure!(
+            actual_directions == case.expected_directions,
+            "unexpected TOC directions for {} on pages {:?}: expected {:?}, got {:?}",
+            case.pdf_path.display(),
+            case.pages,
+            case.expected_directions,
+            actual_directions
         );
         Ok(())
     }
@@ -1134,5 +1210,65 @@ mod tests {
         assert_eq!(window.full_text, "ab cd ef");
         assert_eq!(window.render(), "cd ef");
         assert_eq!(display_width(&window.render()), 5);
+    }
+
+    fn load_live_toc_direction_case() -> Result<LiveTocDirectionCase> {
+        let pdf_path = PathBuf::from(load_required_env(TOC_DIRECTION_TEST_PDF_ENV)?);
+        let pages = load_required_env(TOC_DIRECTION_TEST_PAGES_ENV)?
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(parse_test_page_number)
+            .collect::<Result<Vec<_>>>()?;
+        let expected_directions = load_required_env(TOC_DIRECTION_TEST_EXPECTED_ENV)?
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(parse_direction_hint)
+            .collect::<Result<Vec<_>>>()?;
+
+        ensure!(
+            !pages.is_empty(),
+            "{TOC_DIRECTION_TEST_PAGES_ENV} must contain at least one page number"
+        );
+        ensure!(
+            pages.len() == expected_directions.len(),
+            "{TOC_DIRECTION_TEST_PAGES_ENV} and {TOC_DIRECTION_TEST_EXPECTED_ENV} must have the same number of items"
+        );
+
+        Ok(LiveTocDirectionCase {
+            pdf_path,
+            pages,
+            expected_directions,
+        })
+    }
+
+    fn load_required_env(name: &str) -> Result<String> {
+        std::env::var(name)
+            .with_context(|| format!("missing required environment variable {name}"))
+            .map(|value| value.trim().to_string())
+            .and_then(|value| {
+                ensure!(!value.is_empty(), "{name} must not be empty");
+                Ok(value)
+            })
+    }
+
+    fn parse_test_page_number(value: &str) -> Result<usize> {
+        let page = value
+            .parse::<usize>()
+            .with_context(|| format!("invalid page number `{value}`"))?;
+        ensure!(page > 0, "page numbers must be >= 1");
+        Ok(page)
+    }
+
+    fn parse_direction_hint(value: &str) -> Result<TocDirectionHint> {
+        match value.to_ascii_lowercase().as_str() {
+            "before" => Ok(TocDirectionHint::Before),
+            "after" => Ok(TocDirectionHint::After),
+            "unknown" => Ok(TocDirectionHint::Unknown),
+            _ => anyhow::bail!(
+                "invalid direction `{value}`, expected before, after, or unknown"
+            ),
+        }
     }
 }
