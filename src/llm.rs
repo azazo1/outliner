@@ -12,11 +12,18 @@ use rig::providers::openai;
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
 use tracing::Span;
 
 use crate::model::{RenderedPage, TocExtraction};
-use crate::progress::set_spinner_message;
+use crate::progress::{set_spinner_message, start_spinner};
 
 const OUTPUT_WINDOW_LEN: usize = 44;
 const MAX_SCROLL_CHARS_PER_SECOND: f64 = 180.0;
@@ -65,6 +72,13 @@ pub struct LlmConfig {
 pub struct LlmCall<T> {
     pub data: T,
     pub usage: Usage,
+    pub calls: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VisionRequestConfig {
+    pub batch_size: usize,
+    pub concurrency: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -103,6 +117,7 @@ struct VisionPageObservationBatch {
 
 pub async fn identify_toc_pages(
     config: &LlmConfig,
+    request_config: VisionRequestConfig,
     pages: &[RenderedPage],
     progress_span: Option<&Span>,
     progress_label: &str,
@@ -111,14 +126,19 @@ pub async fn identify_toc_pages(
         bail!("no sampled pages were provided to the TOC locator");
     }
 
-    let prompt = build_multimodal_message(
-        pages,
-        "Decide which of these sampled PDF pages are part of the real table of contents.",
-    )?;
-    stream_structured_output(
+    let batches = chunk_rendered_pages(pages, request_config.batch_size);
+    stream_batched_structured_output(
         config,
+        request_config,
+        batches,
+        |batch_pages| {
+            build_multimodal_message(
+                batch_pages,
+                "Decide which of these sampled PDF pages are part of the real table of contents.",
+            )
+        },
+        merge_toc_page_assessment_batches,
         TOC_DISCOVERY_PREAMBLE,
-        prompt,
         progress_span,
         progress_label,
     )
@@ -127,6 +147,7 @@ pub async fn identify_toc_pages(
 
 pub async fn extract_toc(
     config: &LlmConfig,
+    request_config: VisionRequestConfig,
     pages: &[RenderedPage],
     progress_span: Option<&Span>,
     progress_label: &str,
@@ -135,14 +156,19 @@ pub async fn extract_toc(
         bail!("no candidate pages were provided to the LLM extractor");
     }
 
-    let prompt = build_multimodal_message(
-        pages,
-        "Determine whether these PDF pages contain a table of contents, then extract it.",
-    )?;
-    stream_structured_output(
+    let batches = chunk_rendered_pages(pages, request_config.batch_size);
+    stream_batched_structured_output(
         config,
+        request_config,
+        batches,
+        |batch_pages| {
+            build_multimodal_message(
+                batch_pages,
+                "Determine whether these PDF pages contain a table of contents, then extract it.",
+            )
+        },
+        merge_toc_extractions,
         EXTRACTION_PREAMBLE,
-        prompt,
         progress_span,
         progress_label,
     )
@@ -151,6 +177,7 @@ pub async fn extract_toc(
 
 pub async fn observe_page_labels(
     config: &LlmConfig,
+    request_config: VisionRequestConfig,
     pages: &[RenderedPage],
     progress_span: Option<&Span>,
     progress_label: &str,
@@ -159,17 +186,23 @@ pub async fn observe_page_labels(
         return Ok(LlmCall {
             data: Vec::new(),
             usage: Usage::new(),
+            calls: 0,
         });
     }
 
-    let prompt = build_multimodal_message(
-        pages,
-        "Return the observed printed page labels for these page images.",
-    )?;
-    let response = stream_structured_output::<VisionPageObservationBatch>(
+    let batches = chunk_rendered_pages(pages, request_config.batch_size);
+    let response = stream_batched_structured_output::<VisionPageObservationBatch, _, _>(
         config,
+        request_config,
+        batches,
+        |batch_pages| {
+            build_multimodal_message(
+                batch_pages,
+                "Return the observed printed page labels for these page images.",
+            )
+        },
+        merge_vision_observation_batches,
         "You inspect PDF page images. For each page image, detect the visible printed page label if one is clearly present in the page header or footer. Use the exact visible label, usually digits or roman numerals. If no printed page label is visible, use null. Always return one observation per input page image.",
-        prompt,
         progress_span,
         progress_label,
     )
@@ -177,7 +210,118 @@ pub async fn observe_page_labels(
     Ok(LlmCall {
         data: response.data.observations,
         usage: response.usage,
+        calls: response.calls,
     })
+}
+
+fn chunk_rendered_pages(pages: &[RenderedPage], batch_size: usize) -> Vec<Vec<RenderedPage>> {
+    pages.chunks(batch_size.max(1)).map(|chunk| chunk.to_vec()).collect()
+}
+
+#[derive(Debug)]
+struct QueuedBatch {
+    index: usize,
+    pages: Vec<RenderedPage>,
+}
+
+#[derive(Debug)]
+struct BatchResult<T> {
+    index: usize,
+    response: LlmCall<T>,
+}
+
+fn merge_toc_page_assessment_batches(
+    mut batches: Vec<TocPageAssessmentBatch>,
+) -> Result<TocPageAssessmentBatch> {
+    if batches.is_empty() {
+        bail!("no TOC assessment batches were returned");
+    }
+
+    let mut notes = Vec::new();
+    let mut assessments = Vec::new();
+    let mut toc_found = false;
+
+    for batch in batches.drain(..) {
+        toc_found |= batch.toc_found;
+        if let Some(note) = batch.notes {
+            let trimmed = note.trim();
+            if !trimmed.is_empty() {
+                notes.push(trimmed.to_string());
+            }
+        }
+        assessments.extend(batch.assessments);
+    }
+
+    assessments.sort_by_key(|assessment| assessment.physical_page);
+    assessments.dedup_by_key(|assessment| assessment.physical_page);
+
+    Ok(TocPageAssessmentBatch {
+        toc_found,
+        notes: (!notes.is_empty()).then(|| notes.join("\n")),
+        assessments,
+    })
+}
+
+fn merge_toc_extractions(mut batches: Vec<TocExtraction>) -> Result<TocExtraction> {
+    if batches.is_empty() {
+        bail!("no TOC extraction batches were returned");
+    }
+
+    let mut notes = Vec::new();
+    let mut entries = Vec::new();
+    let mut toc_found = false;
+    let mut toc_start_page = None;
+    let mut toc_end_page = None;
+
+    for batch in batches.drain(..) {
+        toc_found |= batch.toc_found;
+        toc_start_page = match (toc_start_page, batch.toc_start_page) {
+            (Some(current), Some(next)) => Some(current.min(next)),
+            (None, some) | (some, None) => some,
+        };
+        toc_end_page = match (toc_end_page, batch.toc_end_page) {
+            (Some(current), Some(next)) => Some(current.max(next)),
+            (None, some) | (some, None) => some,
+        };
+        if let Some(note) = batch.notes {
+            let trimmed = note.trim();
+            if !trimmed.is_empty() {
+                notes.push(trimmed.to_string());
+            }
+        }
+        entries.extend(batch.entries);
+    }
+
+    if !toc_found {
+        entries.clear();
+        toc_start_page = None;
+        toc_end_page = None;
+    }
+
+    Ok(TocExtraction {
+        toc_found,
+        toc_start_page,
+        toc_end_page,
+        entries,
+        notes: (!notes.is_empty()).then(|| notes.join("\n")),
+    })
+}
+
+fn merge_vision_observation_batches(
+    mut batches: Vec<VisionPageObservationBatch>,
+) -> Result<VisionPageObservationBatch> {
+    if batches.is_empty() {
+        bail!("no page label batches were returned");
+    }
+
+    let mut observations = Vec::new();
+    for batch in batches.drain(..) {
+        observations.extend(batch.observations);
+    }
+    observations.sort_by_key(|observation| observation.physical_page);
+    observations.dedup_by_key(|observation| observation.physical_page);
+
+    Ok(VisionPageObservationBatch { observations })
 }
 
 fn build_multimodal_message(pages: &[RenderedPage], instruction: &str) -> Result<Message> {
@@ -310,7 +454,208 @@ where
     Ok(LlmCall {
         data: response.data,
         usage: response.usage,
+        calls: 1,
     })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Batched worker orchestration needs explicit scheduling and progress inputs"
+)]
+async fn stream_batched_structured_output<T, FBuild, FMerge>(
+    config: &LlmConfig,
+    request_config: VisionRequestConfig,
+    batches: Vec<Vec<RenderedPage>>,
+    build_prompt: FBuild,
+    merge: FMerge,
+    preamble: &str,
+    progress_span: Option<&Span>,
+    progress_label: &str,
+) -> Result<LlmCall<T>>
+where
+    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
+    FBuild: Fn(&[RenderedPage]) -> Result<Message> + Copy + Send + Sync + 'static,
+    FMerge: Fn(Vec<T>) -> Result<T> + Copy + Send + Sync + 'static,
+{
+    if batches.is_empty() {
+        bail!("no vision batches were scheduled");
+    }
+
+    let preamble = preamble.to_string();
+    let total_batches = batches.len();
+    let total_pages: usize = batches.iter().map(Vec::len).sum();
+    let worker_count = request_config.concurrency.max(1).min(total_batches);
+    let queue = Arc::new(Mutex::new(VecDeque::from(
+        batches
+            .into_iter()
+            .enumerate()
+            .map(|(index, pages)| QueuedBatch { index, pages })
+            .collect::<Vec<_>>(),
+    )));
+    let completed_batches = Arc::new(AtomicUsize::new(0));
+    let completed_pages = Arc::new(AtomicUsize::new(0));
+    let mut usage = Usage::new();
+    let mut calls = 0u64;
+    let mut ordered = Vec::with_capacity(total_batches);
+    let mut handles = Vec::with_capacity(worker_count);
+
+    update_batch_progress(
+        progress_span,
+        progress_label,
+        0,
+        total_batches,
+        0,
+        total_pages,
+    );
+
+    for worker_index in 0..worker_count {
+        let worker_span = start_spinner(
+            "llm_worker",
+            worker_idle_label(progress_label, worker_index, worker_count),
+        );
+        let config = config.clone();
+        let preamble = preamble.clone();
+        let queue = Arc::clone(&queue);
+        let completed_batches = Arc::clone(&completed_batches);
+        let completed_pages = Arc::clone(&completed_pages);
+        let parent_span = progress_span.cloned();
+        let progress_label = progress_label.to_string();
+
+        handles.push(tokio::spawn(async move {
+            let result = run_batched_worker::<T, FBuild>(
+                &config,
+                &preamble,
+                build_prompt,
+                queue,
+                worker_index,
+                worker_count,
+                total_batches,
+                total_pages,
+                parent_span,
+                progress_label.clone(),
+                worker_span.clone(),
+                completed_batches,
+                completed_pages,
+            )
+            .await;
+
+            set_spinner_message(
+                &worker_span,
+                worker_done_label(&progress_label, worker_index, worker_count),
+                None,
+                None,
+            );
+            drop(worker_span);
+            result
+        }));
+    }
+
+    for handle in handles {
+        let worker_results = handle.await.map_err(anyhow::Error::new)??;
+        for result in worker_results {
+            usage += result.response.usage;
+            calls += result.response.calls;
+            ordered.push((result.index, result.response.data));
+        }
+    }
+
+    ordered.sort_by_key(|(index, _)| *index);
+    let merged = merge(ordered.into_iter().map(|(_, data)| data).collect())?;
+
+    update_batch_progress(
+        progress_span,
+        progress_label,
+        total_batches,
+        total_batches,
+        total_pages,
+        total_pages,
+    );
+
+    Ok(LlmCall {
+        data: merged,
+        usage,
+        calls,
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Each worker needs queue, progress, and batching context to report independently"
+)]
+async fn run_batched_worker<T, FBuild>(
+    config: &LlmConfig,
+    preamble: &str,
+    build_prompt: FBuild,
+    queue: Arc<Mutex<VecDeque<QueuedBatch>>>,
+    worker_index: usize,
+    worker_count: usize,
+    total_batches: usize,
+    total_pages: usize,
+    parent_span: Option<Span>,
+    progress_label: String,
+    worker_span: Span,
+    completed_batches: Arc<AtomicUsize>,
+    completed_pages: Arc<AtomicUsize>,
+) -> Result<Vec<BatchResult<T>>>
+where
+    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
+    FBuild: Fn(&[RenderedPage]) -> Result<Message> + Copy + Send + Sync + 'static,
+{
+    let mut results = Vec::new();
+
+    loop {
+        let Some(batch) = pop_queued_batch(&queue)? else {
+            break;
+        };
+
+        let prompt = build_prompt(&batch.pages)?;
+        let response = stream_structured_output::<T>(
+            config,
+            preamble,
+            prompt,
+            Some(&worker_span),
+            &worker_batch_label(
+                &progress_label,
+                worker_index,
+                worker_count,
+                batch.index,
+                total_batches,
+                batch.pages.len(),
+            ),
+        )
+        .await?;
+
+        let finished_batches = completed_batches.fetch_add(1, Ordering::Relaxed) + 1;
+        let finished_pages =
+            completed_pages.fetch_add(batch.pages.len(), Ordering::Relaxed) + batch.pages.len();
+        update_batch_progress(
+            parent_span.as_ref(),
+            &progress_label,
+            finished_batches,
+            total_batches,
+            finished_pages,
+            total_pages,
+        );
+        set_spinner_message(
+            &worker_span,
+            worker_idle_label(&progress_label, worker_index, worker_count),
+            None,
+            None,
+        );
+        results.push(BatchResult {
+            index: batch.index,
+            response,
+        });
+    }
+
+    Ok(results)
+}
+
+fn pop_queued_batch(queue: &Arc<Mutex<VecDeque<QueuedBatch>>>) -> Result<Option<QueuedBatch>> {
+    queue
+        .lock()
+        .map_err(|_| anyhow::anyhow!("vision batch queue lock poisoned"))
+        .map(|mut queue| queue.pop_front())
 }
 
 fn update_stream_progress(
@@ -327,6 +672,60 @@ fn update_stream_progress(
             Some(output_window),
         );
     }
+}
+
+fn update_batch_progress(
+    progress_span: Option<&Span>,
+    progress_label: &str,
+    completed_batches: usize,
+    total_batches: usize,
+    completed_pages: usize,
+    total_pages: usize,
+) {
+    if let Some(progress_span) = progress_span {
+        set_spinner_message(
+            progress_span,
+            format!(
+                "{progress_label} | batches {completed_batches}/{total_batches} | pages {completed_pages}/{total_pages}"
+            ),
+            None,
+            None,
+        );
+    }
+}
+
+fn worker_idle_label(progress_label: &str, worker_index: usize, worker_count: usize) -> String {
+    format!(
+        "{progress_label} | worker {}/{} | idle",
+        worker_index + 1,
+        worker_count
+    )
+}
+
+fn worker_done_label(progress_label: &str, worker_index: usize, worker_count: usize) -> String {
+    format!(
+        "{progress_label} | worker {}/{} | done",
+        worker_index + 1,
+        worker_count
+    )
+}
+
+fn worker_batch_label(
+    progress_label: &str,
+    worker_index: usize,
+    worker_count: usize,
+    batch_index: usize,
+    total_batches: usize,
+    page_count: usize,
+) -> String {
+    format!(
+        "{progress_label} | worker {}/{} | batch {}/{} | pages {}",
+        worker_index + 1,
+        worker_count,
+        batch_index + 1,
+        total_batches,
+        page_count
+    )
 }
 
 struct OutputWindow {
@@ -436,6 +835,8 @@ mod tests {
             model: None,
             config: None,
             toc: None,
+            vision_batch_size: None,
+            vision_concurrency: None,
         })?;
 
         Ok(LlmConfig {

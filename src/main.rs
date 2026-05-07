@@ -18,7 +18,10 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::{
     config::{AppArgs, CliArgs, resolve_args},
-    llm::{LlmCall, LlmConfig, extract_toc, identify_toc_pages, observe_page_labels},
+    llm::{
+        LlmCall, LlmConfig, VisionRequestConfig, extract_toc, identify_toc_pages,
+        observe_page_labels,
+    },
     model::{OutlineEntry, RunOutcome, normalize_outline_for_compare, normalize_toc_entries},
     pdf_support::PdfWorkspace,
     progress::{
@@ -126,6 +129,10 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         api_base: args.api_base.clone(),
         api_key: args.api_key.clone(),
     };
+    let vision_request_config = VisionRequestConfig {
+        batch_size: args.vision_batch_size,
+        concurrency: args.vision_concurrency,
+    };
 
     let refined_toc_range = if args.toc.is_some_and(|spec| spec.is_fully_bounded()) {
         let resolved = workspace.resolve_toc_range(args.toc);
@@ -203,15 +210,17 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         let LlmCall {
             data: toc_page_batch,
             usage,
+            calls,
         } = identify_toc_pages(
             &llm_config,
+            vision_request_config,
             &discovery_rendered,
             Some(&discovery_span),
             &discovery_message,
         )
         .instrument(discovery_span.clone())
         .await?;
-        agent_progress.record(usage);
+        agent_progress.record(usage, calls);
         tracing::info!(
             sampled_pages = discovery_rendered.len(),
             toc_found = toc_page_batch.toc_found,
@@ -314,15 +323,17 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     let LlmCall {
         data: extracted,
         usage,
+        calls,
     } = extract_toc(
         &llm_config,
+        vision_request_config,
         &rendered_toc_pages,
         Some(&extract_span),
         &extract_message,
     )
     .instrument(extract_span.clone())
     .await?;
-    agent_progress.record(usage);
+    agent_progress.record(usage, calls);
     tracing::info!(
         toc_found = extracted.toc_found,
         entry_count = extracted.entries.len(),
@@ -430,15 +441,17 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     let LlmCall {
         data: observations,
         usage,
+        calls,
     } = observe_page_labels(
         &llm_config,
+        vision_request_config,
         &rendered_label_pages,
         Some(&observe_span),
         &observe_message,
     )
     .instrument(observe_span.clone())
     .await?;
-    agent_progress.record(usage);
+    agent_progress.record(usage, calls);
     tracing::info!(
         sample_count = rendered_label_pages.len(),
         observation_count = observations.len(),
@@ -623,8 +636,8 @@ struct AgentProgress {
 }
 
 impl AgentProgress {
-    fn record(&mut self, usage: Usage) {
-        self.calls += 1;
+    fn record(&mut self, usage: Usage, calls: u64) {
+        self.calls += calls;
         self.usage += usage;
     }
 }
@@ -773,6 +786,8 @@ mod tests {
                 start: Some(3),
                 end: Some(7),
             }),
+            vision_batch_size: 4,
+            vision_concurrency: 4,
         };
         assert_eq!(stage_count_for(&args), 8);
     }
