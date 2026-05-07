@@ -5,10 +5,11 @@ use http::HeaderMap;
 use rig::OneOrMany;
 use rig::agent::MultiTurnStreamItem;
 use rig::client::completion::CompletionClient;
-use rig::completion::Usage;
+use rig::completion::{TypedPrompt, Usage};
 use rig::extractor::ExtractionResponse;
 use rig::message::{Image, ImageDetail, ImageMediaType, Message, UserContent};
 use rig::providers::openai;
+use schemars::schema_for;
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -203,7 +204,7 @@ pub async fn observe_page_labels(
             )
         },
         merge_vision_observation_batches,
-        "You inspect PDF page images. For each page image, detect the visible printed page label if one is clearly present in the page header or footer. Use the exact visible label, usually digits or roman numerals. If no printed page label is visible, use null. Always return one observation per input page image.",
+        "You inspect PDF page images. Return observations in the same order as the input page images. For each page image, detect the visible printed page label if one is clearly present in the page header or footer. Use the exact visible label, usually digits or roman numerals. If no printed page label is visible, use null. Prefer the schema field `observations`, and each observation should use the field `printed_page_label`. Do not return physical page numbers unless explicitly needed by the schema.",
         progress_span,
         progress_label,
     )
@@ -449,11 +450,22 @@ where
         &output_window.render(),
     );
 
-    let response: ExtractionResponse<T> = ExtractionResponse {
-        data: serde_json::from_str(&final_text)
-            .with_context(|| format!("failed to deserialize structured response: {final_text}"))?,
-        usage,
+    let (data, repair_usage) = match serde_json::from_str::<T>(&final_text) {
+        Ok(data) => (data, Usage::new()),
+        Err(initial_error) => {
+            let (repaired_json, repair_usage) =
+                repair_structured_output::<T>(&client, model, &final_text).await?;
+            let data = serde_json::from_str(&repaired_json).with_context(|| {
+                format!(
+                    "failed to deserialize structured response after repair. original: {final_text}; repaired: {}; initial error: {initial_error}",
+                    repaired_json
+                )
+            })?;
+            (data, repair_usage)
+        }
     };
+    usage += repair_usage;
+    let response: ExtractionResponse<T> = ExtractionResponse { data, usage };
 
     Ok(LlmCall {
         data: response.data,
@@ -837,6 +849,39 @@ fn take_suffix_width(text: &str, max_width: usize) -> String {
     }
 
     chars.into_iter().rev().collect()
+}
+
+async fn repair_structured_output<T>(
+    client: &openai::CompletionsClient,
+    model: &str,
+    invalid_output: &str,
+) -> Result<(String, Usage)>
+where
+    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
+{
+    let schema = serde_json::to_string_pretty(&schema_for!(T))
+        .context("failed to serialize structured output schema for repair")?;
+    let repair_prompt = Message::User {
+        content: OneOrMany::many(vec![UserContent::text(format!(
+            "Rewrite the provided invalid model output into valid JSON that conforms exactly to the target schema.\nReturn only JSON.\nDo not explain.\nIf information is missing, infer the minimum necessary structure from the provided content without inventing unrelated data.\n\nTarget schema:\n{schema}\n\nInvalid output:\n{invalid_output}"
+        ))])
+        .context("repair prompt cannot be empty")?,
+    };
+    let repaired = client
+        .agent(model)
+        .preamble(
+            "You repair malformed structured outputs. Return only valid JSON that conforms exactly to the provided schema.",
+        )
+        .build()
+        .prompt_typed::<serde_json::Value>(repair_prompt)
+        .extended_details()
+        .await
+        .context("failed to repair malformed structured output")?;
+    Ok((
+        serde_json::to_string(&repaired.output)
+            .context("failed to serialize repaired structured output")?,
+        repaired.usage,
+    ))
 }
 
 #[cfg(test)]
