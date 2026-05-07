@@ -52,12 +52,7 @@ impl PdfWorkspace {
             return hinted;
         }
 
-        let hits = batch
-            .assessments
-            .iter()
-            .filter(|assessment| assessment.looks_like_toc || assessment.confidence >= 2)
-            .map(|assessment| assessment.physical_page)
-            .collect::<Vec<_>>();
+        let hits = toc_hit_pages(batch);
         let search_range = hinted.unwrap_or_else(|| default_toc_search_range(self.page_count));
 
         if hits.is_empty() {
@@ -242,11 +237,15 @@ fn sample_pages(range: PageRange, budget: usize) -> Vec<usize> {
     pages
 }
 
+pub fn is_toc_hit(assessment: &crate::llm::TocPageAssessment) -> bool {
+    assessment.toc_direction_hint == TocDirectionHint::Hit
+}
+
 fn toc_hit_pages(batch: &TocPageAssessmentBatch) -> Vec<usize> {
     batch
         .assessments
         .iter()
-        .filter(|assessment| assessment.looks_like_toc || assessment.confidence >= 2)
+        .filter(|assessment| is_toc_hit(assessment))
         .map(|assessment| assessment.physical_page)
         .collect()
 }
@@ -413,8 +412,8 @@ fn render_page_png_bytes(pdf_path: &Path, physical_page: usize) -> Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::{
-        PageOffsets, PdfWorkspace, infer_best_offsets, infer_fallback_offset, resolve_entry_page,
-        sample_pages,
+        PageOffsets, PdfWorkspace, infer_best_offsets, infer_fallback_offset, is_toc_hit,
+        resolve_entry_page, sample_pages,
     };
     use crate::{
         llm::{TocDirectionHint, TocPageAssessment, TocPageAssessmentBatch, VisionPageObservation},
@@ -513,15 +512,11 @@ mod tests {
             assessments: vec![
                 TocPageAssessment {
                     physical_page: 8,
-                    looks_like_toc: false,
                     toc_direction_hint: TocDirectionHint::After,
-                    confidence: 1,
                 },
                 TocPageAssessment {
                     physical_page: 30,
-                    looks_like_toc: false,
                     toc_direction_hint: TocDirectionHint::Before,
-                    confidence: 1,
                 },
             ],
         };
@@ -542,19 +537,25 @@ mod tests {
             assessments: vec![
                 TocPageAssessment {
                     physical_page: 25,
-                    looks_like_toc: false,
                     toc_direction_hint: TocDirectionHint::After,
-                    confidence: 1,
                 },
                 TocPageAssessment {
                     physical_page: 20,
-                    looks_like_toc: false,
                     toc_direction_hint: TocDirectionHint::Before,
-                    confidence: 1,
                 },
             ],
         };
 
         assert_eq!(workspace.narrow_toc_search_range(range, &batch), None);
+    }
+
+    #[test]
+    fn hit_direction_counts_as_toc_hit() {
+        let assessment = TocPageAssessment {
+            physical_page: 12,
+            toc_direction_hint: TocDirectionHint::Hit,
+        };
+
+        assert!(is_toc_hit(&assessment));
     }
 }

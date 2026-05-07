@@ -53,17 +53,18 @@ You inspect sampled PDF page images and decide which pages are part of a real ta
 
 Rules:
 - Evaluate each page independently, then summarize the batch.
-- looks_like_toc = true only when the page itself is a table-of-contents page, or a standalone TOC heading page that directly belongs to adjacent TOC listing pages.
-- Body pages, chapter openers, references, indexes, blank separators, and running headers are not TOC pages.
+- Treat `hit` as meaning the page itself is a table-of-contents page, or a standalone TOC heading page that directly belongs to adjacent TOC listing pages.
+- Body pages, chapter openers, references, indexes, blank separators, and running headers should not be marked as `hit`.
+- Use the visible page content itself to infer direction when the page is not TOC. Relevant cues include cover pages, title pages, copyright or publication-info pages, cataloging pages, publisher pages, foreword, preface, introduction, chapter openers, appendices, references, bibliography, and index pages.
+- Also use visible printed page numbers, roman numerals, and the PDF physical page number label that accompanies each image as supporting evidence about whether the TOC is likely earlier or later in the document.
 - For each page, set toc_direction_hint to:
-  - unknown when the page itself looks like TOC, or when there is not enough evidence to infer direction.
+  - hit when the page itself is TOC, including a TOC listing page or a standalone TOC heading page that directly belongs to adjacent TOC listing pages.
+  - unknown when the page is not TOC and there is not enough evidence to infer direction.
   - before when the page strongly suggests the real TOC appears earlier in the document than this page.
   - after when the page strongly suggests the real TOC appears later in the document than this page.
-- confidence uses 0 to 3:
-  - 0 = definitely not TOC
-  - 1 = weak signal
-  - 2 = likely TOC
-  - 3 = strong TOC evidence
+- Typical after cues: cover, half-title, title page, copyright page, publication-info page, cataloging page, dedication, foreword, preface, or other front-matter pages that usually appear before the TOC.
+- Typical before cues: chapter body pages, appendices, bibliography, references, index, colophon, or other back-matter and main-body pages that usually appear after the TOC.
+- Prefer before or after over unknown when those cues are clear and conventional.
 - Always return one assessment per input page.
 "#;
 
@@ -90,6 +91,7 @@ pub struct VisionRequestConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TocDirectionHint {
+    Hit,
     Before,
     After,
     Unknown,
@@ -100,11 +102,7 @@ pub struct TocPageAssessment {
     #[schemars(required)]
     pub physical_page: usize,
     #[schemars(required)]
-    pub looks_like_toc: bool,
-    #[schemars(required)]
     pub toc_direction_hint: TocDirectionHint,
-    #[schemars(required)]
-    pub confidence: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1269,10 +1267,13 @@ mod tests {
 
     fn parse_direction_hint(value: &str) -> Result<TocDirectionHint> {
         match value.to_ascii_lowercase().as_str() {
+            "hit" => Ok(TocDirectionHint::Hit),
             "before" => Ok(TocDirectionHint::Before),
             "after" => Ok(TocDirectionHint::After),
             "unknown" => Ok(TocDirectionHint::Unknown),
-            _ => anyhow::bail!("invalid direction `{value}`, expected before, after, or unknown"),
+            _ => anyhow::bail!(
+                "invalid direction `{value}`, expected hit, before, after, or unknown"
+            ),
         }
     }
 }

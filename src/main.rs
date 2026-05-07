@@ -25,7 +25,7 @@ use crate::{
     model::{
         OutlineEntry, PageRange, RunOutcome, normalize_outline_for_compare, normalize_toc_entries,
     },
-    pdf_support::PdfWorkspace,
+    pdf_support::{PdfWorkspace, is_toc_hit},
     progress::{
         finish_stage, format_path_for_tracing, format_usage_details, init_tracing, mark_complete,
         set_bar_message, set_run_status, start_bar, start_run_progress, start_spinner,
@@ -658,7 +658,7 @@ async fn discover_toc_range(
         let hit_count = toc_page_batch
             .assessments
             .iter()
-            .filter(|assessment| assessment.looks_like_toc || assessment.confidence >= 2)
+            .filter(|assessment| is_toc_hit(assessment))
             .count();
         tracing::info!(
             search_start = candidate_range.start,
