@@ -204,7 +204,7 @@ fn build_multimodal_message(pages: &[RenderedPage], instruction: &str) -> Result
     })
 }
 
-fn build_openai_client(config: &LlmConfig) -> Result<openai::Client> {
+fn build_openai_client(config: &LlmConfig) -> Result<openai::CompletionsClient> {
     let api_key = config
         .api_key
         .clone()
@@ -219,7 +219,7 @@ fn build_openai_client(config: &LlmConfig) -> Result<openai::Client> {
         http::HeaderValue::from_static("application/json"),
     );
 
-    let mut builder = openai::Client::builder()
+    let mut builder = openai::CompletionsClient::builder()
         .api_key(api_key)
         .http_headers(headers);
     if let Some(base_url) = config
@@ -455,9 +455,7 @@ mod tests {
             .as_deref()
             .unwrap_or(rig::providers::openai::GPT_4O_MINI);
         let agent = client
-            .completion_model(model)
-            .completions_api()
-            .into_agent_builder()
+            .agent(model)
             .preamble("Repeat the user message exactly.")
             .temperature(0.0)
             .max_tokens(4)
@@ -479,9 +477,7 @@ mod tests {
             .as_deref()
             .unwrap_or(rig::providers::openai::GPT_4O_MINI);
         let agent = client
-            .completion_model(model)
-            .completions_api()
-            .into_agent_builder()
+            .agent(model)
             .preamble("Repeat the user message exactly.")
             .temperature(0.0)
             .max_tokens(4)
