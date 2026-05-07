@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     collections::HashMap,
     path::{Path, PathBuf},
     process::Command,
@@ -16,6 +17,11 @@ use crate::{
 };
 
 const DISCOVERY_SAMPLE_BUDGET: usize = 12;
+const DISCOVERY_FRONT_STRIDE_WINDOW_PAGES: usize = 16;
+const DISCOVERY_FRONT_STRIDE_SAMPLES: usize = 8;
+const DISCOVERY_FRONT_PREFIX_RATIO_NUMERATOR: usize = 3;
+const DISCOVERY_FRONT_PREFIX_RATIO_DENOMINATOR: usize = 10;
+const DISCOVERY_FRONT_PREFIX_SAMPLES: usize = 4;
 const LABEL_SAMPLE_BUDGET: usize = 14;
 const DISCOVERY_REFINE_TARGET_LEN: usize = 18;
 
@@ -37,7 +43,7 @@ impl PdfWorkspace {
     }
 
     pub fn discover_toc_sample_pages_in_range(&self, range: PageRange) -> Vec<usize> {
-        sample_pages(range, DISCOVERY_SAMPLE_BUDGET)
+        sample_discovery_pages(range)
     }
 
     pub fn initial_toc_search_range(&self, toc: Option<PageRangeSpec>) -> PageRange {
@@ -269,14 +275,68 @@ fn sample_pages(range: PageRange, budget: usize) -> Vec<usize> {
         return range.pages();
     }
 
+    if budget == 1 {
+        return vec![range.start];
+    }
+
     let span = range.end - range.start;
-    let last_index = budget.saturating_sub(1).max(1);
-    let mut pages = (0..budget)
+    let last_index = budget.saturating_sub(1);
+    (0..budget)
         .map(|index| range.start + (span * index) / last_index)
-        .collect::<Vec<_>>();
-    pages.sort_unstable();
-    pages.dedup();
-    pages
+        .collect()
+}
+
+fn sample_discovery_pages(range: PageRange) -> Vec<usize> {
+    if range.len() <= DISCOVERY_SAMPLE_BUDGET {
+        return range.pages();
+    }
+
+    let mut pages = BTreeSet::new();
+
+    let front_window_end = range
+        .start
+        .saturating_add(DISCOVERY_FRONT_STRIDE_WINDOW_PAGES.saturating_sub(1))
+        .min(range.end);
+    let stride_start = range.start;
+    if stride_start <= front_window_end {
+        let front_stride_pages = (stride_start..=front_window_end)
+            .step_by(2)
+            .take(DISCOVERY_FRONT_STRIDE_SAMPLES);
+        pages.extend(front_stride_pages);
+    }
+
+    let prefix_len = range
+        .len()
+        .saturating_mul(DISCOVERY_FRONT_PREFIX_RATIO_NUMERATOR)
+        .div_ceil(DISCOVERY_FRONT_PREFIX_RATIO_DENOMINATOR)
+        .max(1);
+    let prefix_end = range
+        .start
+        .saturating_add(prefix_len.saturating_sub(1))
+        .min(range.end);
+    let sparse_prefix_start = front_window_end.saturating_add(1);
+    if let Some(sparse_prefix_range) = PageRange::new(sparse_prefix_start, prefix_end) {
+        pages.extend(sample_pages(
+            sparse_prefix_range,
+            DISCOVERY_FRONT_PREFIX_SAMPLES.min(sparse_prefix_range.len()),
+        ));
+    }
+
+    fill_discovery_samples(&mut pages, range, DISCOVERY_SAMPLE_BUDGET);
+    pages.into_iter().collect()
+}
+
+fn fill_discovery_samples(pages: &mut BTreeSet<usize>, range: PageRange, budget: usize) {
+    if pages.len() >= budget {
+        return;
+    }
+
+    for page in range.pages() {
+        pages.insert(page);
+        if pages.len() == budget {
+            return;
+        }
+    }
 }
 
 pub fn is_toc_hit(assessment: &crate::llm::TocPageAssessment) -> bool {
@@ -502,7 +562,7 @@ fn ocr_png_bytes(png_bytes: &[u8], physical_page: usize) -> Result<String> {
 mod tests {
     use super::{
         PageOffsets, PdfWorkspace, infer_best_offsets, infer_fallback_offset, is_toc_hit,
-        resolve_entry_page, sample_pages,
+        resolve_entry_page, sample_discovery_pages, sample_pages,
     };
     use crate::{
         llm::{TocDirectionHint, TocPageAssessment, TocPageAssessmentBatch, VisionPageObservation},
@@ -516,6 +576,23 @@ mod tests {
         assert_eq!(pages.first().copied(), Some(1));
         assert_eq!(pages.last().copied(), Some(100));
         assert_eq!(pages.len(), 5);
+    }
+
+    #[test]
+    fn sample_pages_prioritizes_dense_front_pages_for_discovery() {
+        let pages = sample_discovery_pages(PageRange::new(1, 72).expect("range"));
+
+        assert_eq!(
+            pages,
+            vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 18, 20, 22]
+        );
+    }
+
+    #[test]
+    fn sample_discovery_pages_fills_early_pages_when_front_prefix_is_short() {
+        let pages = sample_discovery_pages(PageRange::new(1, 13).expect("range"));
+
+        assert_eq!(pages, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13]);
     }
 
     #[test]
