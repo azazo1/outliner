@@ -176,9 +176,15 @@ impl PageRangeSpec {
 pub struct TocExtraction {
     #[schemars(required)]
     pub toc_found: bool,
-    #[schemars(required)]
+    #[schemars(
+        required,
+        description = "The first TOC page as a 1-based PDF physical page number. This is not the printed page label shown inside the book. Use a positive integer within the provided TOC document page range. Never use 0 or a negative value."
+    )]
     pub toc_start_page: Option<usize>,
-    #[schemars(required)]
+    #[schemars(
+        required,
+        description = "Same with toc_start_page, but the last TOC page."
+    )]
     pub toc_end_page: Option<usize>,
     #[schemars(required)]
     pub entries: Vec<TocCandidateEntry>,
