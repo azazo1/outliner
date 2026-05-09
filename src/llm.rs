@@ -58,6 +58,7 @@ Rules:
 - Typical before cues: chapter body pages, appendices, bibliography, references, index, colophon, or other back-matter and main-body pages that usually appear after the TOC.
 - Prefer before or after over unknown when those cues are clear and conventional.
 - Always return one assessment per input page.
+- Return assessments in the same order as the input pages.
 "#;
 
 const TEXT_TOC_DISCOVERY_PREAMBLE: &str = r#"
@@ -73,6 +74,7 @@ Rules:
   - unknown when the text is insufficient or too noisy to infer direction.
 - Prefer hit over before or after when the text itself clearly contains a real TOC.
 - Always return one assessment per input page.
+- Return assessments in the same order as the input pages.
 - toc_found should be true when at least one page is marked as hit.
 "#;
 
@@ -94,6 +96,7 @@ Rules:
 - Do not paraphrase, translate, normalize, or collapse stylized TOC text into prose.
 - Do not flatten parent and child lines into one uniform style.
 - Use `has_unclear_regions = true` when any important fragment is unclear.
+- Return page records in the same order as the input pages.
 "#;
 
 const TOC_MARKDOWN_EXTRACTION_PREAMBLE: &str = r#"
@@ -125,6 +128,7 @@ Rules:
 - The request JSON lists the unclear page and line hint for each clarification.
 - The provided images may include the requested page and the immediately preceding page for context.
 - Return one result per request.
+- Return results in the same order as the input requests.
 - Use `clarification` to state the minimum concrete detail needed to resolve the ambiguity.
 - Do not restate the whole page.
 - Do not invent missing text when the image is still unreadable.
@@ -188,6 +192,12 @@ pub struct TocPageAssessment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct TocPageAssessmentAnswer {
+    #[schemars(required)]
+    toc_direction_hint: TocDirectionHint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TocPageAssessmentBatch {
     #[schemars(required)]
     pub toc_found: bool,
@@ -198,14 +208,16 @@ pub struct TocPageAssessmentBatch {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct TocTextInferenceBatch {
+struct TocAssessmentAnswerBatch {
     #[schemars(required)]
-    pub toc_found: bool,
+    toc_found: bool,
     #[schemars(required)]
-    pub notes: Option<String>,
+    notes: Option<String>,
     #[schemars(required)]
-    pub assessments: Vec<TocPageAssessment>,
+    assessments: Vec<TocPageAssessmentAnswer>,
 }
+
+pub type TocTextInferenceBatch = TocPageAssessmentBatch;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VisionPageObservation {
@@ -228,15 +240,37 @@ struct VisionPageObservationBatch {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct TocMarkdownTranscriptionBatch {
+struct TocMarkdownPageBatch {
     #[schemars(required)]
     pages: Vec<TocPageMarkdown>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct TocPageMarkdownAnswer {
+    #[schemars(required)]
+    markdown: String,
+    #[schemars(required)]
+    layout_notes: String,
+    #[schemars(required)]
+    has_unclear_regions: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct TocMarkdownAnswerBatch {
+    #[schemars(required)]
+    pages: Vec<TocPageMarkdownAnswer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct VisualReviewBatch {
     #[schemars(required)]
-    results: Vec<VisualReviewResult>,
+    results: Vec<VisualReviewAnswer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct VisualReviewAnswer {
+    #[schemars(required)]
+    clarification: String,
 }
 
 pub async fn identify_toc_pages(
@@ -252,7 +286,7 @@ pub async fn identify_toc_pages(
     }
 
     let batches = chunk_rendered_pages(pages, request_config.batch_size);
-    stream_batched_structured_output(
+    let response = stream_batched_structured_output(
         config,
         request_config,
         batches,
@@ -262,14 +296,30 @@ pub async fn identify_toc_pages(
                 "Decide which of these sampled PDF pages are part of the real table of contents.",
             )
         },
-        merge_toc_page_assessment_batches,
+        merge_toc_assessment_answer_batches,
         TOC_DISCOVERY_PREAMBLE,
         progress_span,
         progress_label,
         trace_recorder,
         "identify_toc_pages",
     )
-    .await
+    .await?;
+
+    let assessments = bind_toc_page_assessments(
+        &physical_pages_from_rendered(pages),
+        &response.data.assessments,
+    )?;
+
+    Ok(LlmCall {
+        data: TocPageAssessmentBatch {
+            toc_found: response.data.toc_found,
+            notes: response.data.notes,
+            assessments,
+        },
+        usage: response.usage,
+        calls: response.calls,
+        trace: response.trace,
+    })
 }
 
 pub async fn infer_toc_from_page_text(
@@ -287,7 +337,7 @@ pub async fn infer_toc_from_page_text(
         pages,
         "Infer which of these extracted PDF pages are TOC pages, and otherwise whether the TOC is before or after them.",
     )?;
-    stream_structured_output(
+    let response = stream_structured_output::<TocAssessmentAnswerBatch>(
         config,
         TEXT_TOC_DISCOVERY_PREAMBLE,
         prompt,
@@ -298,7 +348,23 @@ pub async fn infer_toc_from_page_text(
         None,
         page_range_from_extracted_pages(pages),
     )
-    .await
+    .await?;
+
+    let assessments = bind_toc_page_assessments(
+        &physical_pages_from_extracted(pages),
+        &response.data.assessments,
+    )?;
+
+    Ok(LlmCall {
+        data: TocTextInferenceBatch {
+            toc_found: response.data.toc_found,
+            notes: response.data.notes,
+            assessments,
+        },
+        usage: response.usage,
+        calls: response.calls,
+        trace: response.trace,
+    })
 }
 
 pub async fn observe_page_labels(
@@ -411,7 +477,7 @@ pub async fn transcribe_toc_pages_to_markdown(
 
                 let prompt = build_toc_markdown_transcription_message(&batch.pages)?;
                 let page_range_label = evidence_page_range_label(&batch.pages);
-                let response = stream_structured_output::<TocMarkdownTranscriptionBatch>(
+                let response = stream_structured_output::<TocMarkdownAnswerBatch>(
                     &config,
                     TOC_MARKDOWN_TRANSCRIPTION_PREAMBLE,
                     prompt,
@@ -423,6 +489,9 @@ pub async fn transcribe_toc_pages_to_markdown(
                     Some(page_range_label.clone()),
                 )
                 .await?;
+                let page_batch = TocMarkdownPageBatch {
+                    pages: bind_toc_markdown_pages(&batch.pages, &response.data.pages)?,
+                };
 
                 let finished_batches = completed_batches.fetch_add(1, Ordering::Relaxed) + 1;
                 let finished_pages = completed_pages
@@ -444,7 +513,12 @@ pub async fn transcribe_toc_pages_to_markdown(
                 );
                 results.push(BatchResult {
                     index: batch.index,
-                    response,
+                    response: LlmCall {
+                        data: page_batch,
+                        usage: response.usage,
+                        calls: response.calls,
+                        trace: response.trace,
+                    },
                 });
             }
 
@@ -549,8 +623,10 @@ pub async fn review_toc_visual_gaps(
     )
     .await?;
 
+    let results = bind_visual_review_results(requests, &response.data.results)?;
+
     Ok(LlmCall {
-        data: response.data.results,
+        data: results,
         usage: response.usage,
         calls: response.calls,
         trace: response.trace,
@@ -582,9 +658,9 @@ struct BatchResult<T> {
     response: LlmCall<T>,
 }
 
-fn merge_toc_page_assessment_batches(
-    mut batches: Vec<TocPageAssessmentBatch>,
-) -> Result<TocPageAssessmentBatch> {
+fn merge_toc_assessment_answer_batches(
+    mut batches: Vec<TocAssessmentAnswerBatch>,
+) -> Result<TocAssessmentAnswerBatch> {
     if batches.is_empty() {
         bail!("no TOC assessment batches were returned");
     }
@@ -604,10 +680,7 @@ fn merge_toc_page_assessment_batches(
         assessments.extend(batch.assessments);
     }
 
-    assessments.sort_by_key(|assessment| assessment.physical_page);
-    assessments.dedup_by_key(|assessment| assessment.physical_page);
-
-    Ok(TocPageAssessmentBatch {
+    Ok(TocAssessmentAnswerBatch {
         toc_found,
         notes: (!notes.is_empty()).then(|| notes.join("\n")),
         assessments,
@@ -661,6 +734,83 @@ fn bind_page_label_observations(
                 .and_then(|observation| observation.page.clone()),
         })
         .collect()
+}
+
+fn physical_pages_from_rendered(pages: &[RenderedPage]) -> Vec<usize> {
+    pages.iter().map(|page| page.physical_page).collect()
+}
+
+fn physical_pages_from_extracted(pages: &[ExtractedPageText]) -> Vec<usize> {
+    pages.iter().map(|page| page.physical_page).collect()
+}
+
+fn bind_toc_page_assessments(
+    physical_pages: &[usize],
+    answers: &[TocPageAssessmentAnswer],
+) -> Result<Vec<TocPageAssessment>> {
+    if answers.len() != physical_pages.len() {
+        bail!(
+            "TOC assessment count does not match page count: expected {}, got {}",
+            physical_pages.len(),
+            answers.len()
+        );
+    }
+
+    Ok(physical_pages
+        .iter()
+        .zip(answers.iter())
+        .map(|(physical_page, answer)| TocPageAssessment {
+            physical_page: *physical_page,
+            toc_direction_hint: answer.toc_direction_hint,
+        })
+        .collect())
+}
+
+fn bind_toc_markdown_pages(
+    pages: &[TocPageEvidence],
+    answers: &[TocPageMarkdownAnswer],
+) -> Result<Vec<TocPageMarkdown>> {
+    if answers.len() != pages.len() {
+        bail!(
+            "TOC markdown page count does not match evidence count: expected {}, got {}",
+            pages.len(),
+            answers.len()
+        );
+    }
+
+    Ok(pages
+        .iter()
+        .zip(answers.iter())
+        .map(|(page, answer)| TocPageMarkdown {
+            physical_page: page.physical_page,
+            markdown: answer.markdown.clone(),
+            layout_notes: answer.layout_notes.clone(),
+            has_unclear_regions: answer.has_unclear_regions,
+        })
+        .collect())
+}
+
+fn bind_visual_review_results(
+    requests: &[VisualReviewRequest],
+    answers: &[VisualReviewAnswer],
+) -> Result<Vec<VisualReviewResult>> {
+    if answers.len() != requests.len() {
+        bail!(
+            "visual review result count does not match request count: expected {}, got {}",
+            requests.len(),
+            answers.len()
+        );
+    }
+
+    Ok(requests
+        .iter()
+        .zip(answers.iter())
+        .map(|(request, answer)| VisualReviewResult {
+            physical_page: request.physical_page,
+            line_hint: request.line_hint.clone(),
+            clarification: answer.clarification.clone(),
+        })
+        .collect())
 }
 
 fn build_multimodal_message(pages: &[RenderedPage], instruction: &str) -> Result<Message> {
@@ -1738,12 +1888,13 @@ mod tests {
 
     use super::{
         LlmConfig, ObservedPrintedPageLabel, OutputWindow, RenderedPage, TocDirectionHint,
-        VisionRequestConfig, batch_page_range_label, bind_page_label_observations,
-        build_openai_client, display_width, identify_toc_pages, take_prefix_width,
-        take_suffix_width,
+        TocPageAssessmentAnswer, TocPageMarkdownAnswer, VisionRequestConfig, VisualReviewAnswer,
+        batch_page_range_label, bind_page_label_observations, bind_toc_markdown_pages,
+        bind_toc_page_assessments, bind_visual_review_results, build_openai_client, display_width,
+        identify_toc_pages, take_prefix_width, take_suffix_width,
     };
     use crate::config::{CliArgs, resolve_args};
-    use crate::model::TocPageMarkdown;
+    use crate::model::{TocPageEvidence, TocPageMarkdown, VisualReviewRequest};
     use crate::pdf_support::PdfWorkspace;
     use crate::qpdf_outline::open_pdf;
 
@@ -1973,6 +2124,130 @@ mod tests {
         assert_eq!(bound[0].printed_page_label.as_deref(), Some("1"));
         assert_eq!(bound[1].physical_page, 15);
         assert_eq!(bound[1].printed_page_label.as_deref(), Some("4"));
+    }
+
+    #[test]
+    fn bind_toc_page_assessments_uses_input_page_order() {
+        let physical_pages = vec![12, 15];
+        let answers = vec![
+            TocPageAssessmentAnswer {
+                toc_direction_hint: TocDirectionHint::Hit,
+            },
+            TocPageAssessmentAnswer {
+                toc_direction_hint: TocDirectionHint::Before,
+            },
+        ];
+
+        let bound = bind_toc_page_assessments(&physical_pages, &answers).expect("bind assessments");
+
+        assert_eq!(bound[0].physical_page, 12);
+        assert_eq!(bound[0].toc_direction_hint, TocDirectionHint::Hit);
+        assert_eq!(bound[1].physical_page, 15);
+        assert_eq!(bound[1].toc_direction_hint, TocDirectionHint::Before);
+    }
+
+    #[test]
+    fn bind_toc_markdown_pages_uses_input_page_order() {
+        let pages = vec![
+            TocPageEvidence {
+                physical_page: 18,
+                pdf_text: None,
+                rendered_page: RenderedPage {
+                    physical_page: 18,
+                    png_bytes: Vec::new(),
+                },
+            },
+            TocPageEvidence {
+                physical_page: 19,
+                pdf_text: None,
+                rendered_page: RenderedPage {
+                    physical_page: 19,
+                    png_bytes: Vec::new(),
+                },
+            },
+        ];
+        let answers = vec![
+            TocPageMarkdownAnswer {
+                markdown: "m1".to_string(),
+                layout_notes: "l1".to_string(),
+                has_unclear_regions: false,
+            },
+            TocPageMarkdownAnswer {
+                markdown: "m2".to_string(),
+                layout_notes: "l2".to_string(),
+                has_unclear_regions: true,
+            },
+        ];
+
+        let bound = bind_toc_markdown_pages(&pages, &answers).expect("bind markdown pages");
+
+        assert_eq!(bound[0].physical_page, 18);
+        assert_eq!(bound[0].markdown, "m1");
+        assert_eq!(bound[1].physical_page, 19);
+        assert_eq!(bound[1].layout_notes, "l2");
+        assert!(bound[1].has_unclear_regions);
+    }
+
+    #[test]
+    fn bind_visual_review_results_preserves_request_identity() {
+        let requests = vec![
+            VisualReviewRequest {
+                physical_page: 12,
+                reason: "missing text".to_string(),
+                line_hint: "1.2.2 continuation".to_string(),
+            },
+            VisualReviewRequest {
+                physical_page: 15,
+                reason: "ambiguous indent".to_string(),
+                line_hint: "7.7.4 conditional compile".to_string(),
+            },
+        ];
+        let answers = vec![
+            VisualReviewAnswer {
+                clarification: "Continuation belongs to 1.2.2.".to_string(),
+            },
+            VisualReviewAnswer {
+                clarification: "This line is indented as a child entry.".to_string(),
+            },
+        ];
+
+        let bound = bind_visual_review_results(&requests, &answers).expect("bind review results");
+
+        assert_eq!(bound.len(), 2);
+        assert_eq!(bound[0].physical_page, 12);
+        assert_eq!(bound[0].line_hint, "1.2.2 continuation");
+        assert_eq!(bound[0].clarification, "Continuation belongs to 1.2.2.");
+        assert_eq!(bound[1].physical_page, 15);
+        assert_eq!(bound[1].line_hint, "7.7.4 conditional compile");
+        assert_eq!(
+            bound[1].clarification,
+            "This line is indented as a child entry."
+        );
+    }
+
+    #[test]
+    fn bind_visual_review_results_rejects_count_mismatch() {
+        let requests = vec![VisualReviewRequest {
+            physical_page: 12,
+            reason: "missing text".to_string(),
+            line_hint: "1.2.2 continuation".to_string(),
+        }];
+        let answers = vec![
+            VisualReviewAnswer {
+                clarification: "Continuation belongs to 1.2.2.".to_string(),
+            },
+            VisualReviewAnswer {
+                clarification: "Extra answer".to_string(),
+            },
+        ];
+
+        let error = bind_visual_review_results(&requests, &answers)
+            .expect_err("count mismatch should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("visual review result count does not match request count")
+        );
     }
 
     #[test]
