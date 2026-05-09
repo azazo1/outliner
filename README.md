@@ -72,7 +72,7 @@ outliner ./assets/sample-text.pdf
 默认会在输入文件同目录生成一个新文件:
 
 ```text
-outlined_sample-text.pdf
+sample-text_outlined.pdf
 ```
 
 指定输出路径:
@@ -118,7 +118,7 @@ outliner [OPTIONS] <INPUT>
 ```
 
 - `<INPUT>`: 输入 PDF 路径
-- `--output <OUTPUT>`: 输出 PDF 路径. 不传时默认生成 `outlined_<原文件名>.pdf`
+- `--output <OUTPUT>`: 输出 PDF 路径. 不传时默认生成 `<原文件名>_outlined.pdf`
 - `--model <MODEL>`: 覆盖配置文件中的模型名
 - `--config <PATH>`: 指定配置文件路径, 默认是 `~/.config/outliner/config.toml`
 - `--toc <RANGE>`: 指定目录页搜索或处理范围
@@ -228,7 +228,7 @@ outliner [OPTIONS] <INPUT>
 默认不会原地覆盖输入文件. 默认输出文件名规则是:
 
 ```text
-outlined_<输入文件名去掉扩展名>.<原扩展名>
+<输入文件名去掉扩展名>_outlined.<原扩展名>
 ```
 
 只有在 `--output` 显式传入和输入路径相同的情况下, 程序才会先写入临时文件, 再替换原文件.
@@ -239,8 +239,8 @@ outlined_<输入文件名去掉扩展名>.<原扩展名>
 
 - `assets/sample-text.pdf`
 - `assets/sample-image-and-large.pdf`
-- `assets/outlined_sample-text.pdf`
-- `assets/outlined_sample-image-and-large.pdf`
+- `assets/sample-text_outlined.pdf`
+- `assets/sample-image-and-large_outlined.pdf`
 
 可以直接对照输入和输出效果.
 

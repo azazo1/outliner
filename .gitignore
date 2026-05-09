@@ -1,6 +1,6 @@
 /target
 /assets/sample-*.pdf
 .DS_Store
-outlined_*.pdf
+*_outlined.pdf
 .env
 /outputs/

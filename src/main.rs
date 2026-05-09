@@ -980,7 +980,7 @@ fn determine_output_path(input: &Path, output: Option<&Path>) -> PathBuf {
             return input.to_path_buf();
         };
         input.with_file_name(format!(
-            "outlined_{}.{}",
+            "{}_outlined.{}",
             stem.to_string_lossy(),
             ext.to_string_lossy()
         ))
