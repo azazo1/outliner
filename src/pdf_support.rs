@@ -248,7 +248,7 @@ impl PdfWorkspace {
         let anchors = observation_map(observations);
         let fallback_offset = infer_fallback_offset(entries, observations, self.page_count);
 
-        entries
+        let calibrated = entries
             .iter()
             .map(|entry| {
                 let page_label = crate::model::parse_page_label(&entry.page);
@@ -265,7 +265,9 @@ impl PdfWorkspace {
                     physical_page,
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+
+        backfill_missing_entry_pages(entries, &calibrated)
     }
 }
 
@@ -441,6 +443,51 @@ fn resolve_entry_page(
         .or(fallback_offset)
         .map(|value| clamp_page(value + 1, page_count))
         .unwrap_or(1)
+}
+
+fn backfill_missing_entry_pages(
+    source_entries: &[TocCandidateEntry],
+    entries: &[OutlineEntry],
+) -> Vec<OutlineEntry> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+
+    if source_entries.len() != entries.len() {
+        return entries.to_vec();
+    }
+
+    let mut backfilled = entries.to_vec();
+    let mut nearest_child_page_by_level = vec![None; max_level(entries).saturating_add(2)];
+    let mut nearest_sibling_or_after_page = None;
+
+    for index in (0..entries.len()).rev() {
+        let level = entries[index].level;
+        let child_page = nearest_child_page_by_level
+            .iter()
+            .skip(level + 1)
+            .find_map(|page| *page);
+        if source_entries[index].page.trim().is_empty()
+            && let Some(page) = child_page.or(nearest_sibling_or_after_page)
+        {
+            backfilled[index].physical_page = page;
+        }
+
+        if nearest_child_page_by_level.len() <= level {
+            nearest_child_page_by_level.resize(level + 1, None);
+        }
+        nearest_child_page_by_level[level] = Some(backfilled[index].physical_page);
+        for deeper in nearest_child_page_by_level.iter_mut().skip(level + 1) {
+            *deeper = None;
+        }
+        nearest_sibling_or_after_page = Some(backfilled[index].physical_page);
+    }
+
+    backfilled
+}
+
+fn max_level(entries: &[OutlineEntry]) -> usize {
+    entries.iter().map(|entry| entry.level).max().unwrap_or(1)
 }
 
 fn infer_fallback_offset(
@@ -627,8 +674,9 @@ fn ocr_png_bytes(png_bytes: &[u8], physical_page: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PageOffsets, PdfWorkspace, infer_best_offsets, infer_fallback_offset, is_toc_hit,
-        resolve_entry_page, run_page_tasks_with_progress, sample_discovery_pages, sample_pages,
+        PageOffsets, PdfWorkspace, backfill_missing_entry_pages, infer_best_offsets,
+        infer_fallback_offset, is_toc_hit, resolve_entry_page, run_page_tasks_with_progress,
+        sample_discovery_pages, sample_pages,
     };
     use crate::{
         llm::{TocDirectionHint, TocPageAssessment, TocPageAssessmentBatch, VisionPageObservation},
@@ -737,6 +785,92 @@ mod tests {
         );
 
         assert_eq!(page, 13);
+    }
+
+    #[test]
+    fn backfill_missing_entry_pages_uses_first_child_page_for_group_headings() {
+        let source_entries = vec![
+            TocCandidateEntry {
+                title: "第一部分 初级篇".to_string(),
+                level: 1,
+                page: "".to_string(),
+            },
+            TocCandidateEntry {
+                title: "第一讲 Verilog 的基本知识".to_string(),
+                level: 2,
+                page: "".to_string(),
+            },
+            TocCandidateEntry {
+                title: "1.1 硬件描述语言 HDL".to_string(),
+                level: 3,
+                page: "1".to_string(),
+            },
+            TocCandidateEntry {
+                title: "1.2 Verilog HDL 的历史".to_string(),
+                level: 3,
+                page: "2".to_string(),
+            },
+        ];
+        let entries = vec![
+            crate::model::OutlineEntry {
+                title: "第一部分 初级篇".to_string(),
+                level: 1,
+                physical_page: 1,
+            },
+            crate::model::OutlineEntry {
+                title: "第一讲 Verilog 的基本知识".to_string(),
+                level: 2,
+                physical_page: 1,
+            },
+            crate::model::OutlineEntry {
+                title: "1.1 硬件描述语言 HDL".to_string(),
+                level: 3,
+                physical_page: 20,
+            },
+            crate::model::OutlineEntry {
+                title: "1.2 Verilog HDL 的历史".to_string(),
+                level: 3,
+                physical_page: 21,
+            },
+        ];
+
+        let backfilled = backfill_missing_entry_pages(&source_entries, &entries);
+        assert_eq!(backfilled[0].physical_page, 20);
+        assert_eq!(backfilled[1].physical_page, 20);
+        assert_eq!(backfilled[2].physical_page, 20);
+        assert_eq!(backfilled[3].physical_page, 21);
+    }
+
+    #[test]
+    fn backfill_missing_entry_pages_falls_forward_without_children() {
+        let source_entries = vec![
+            TocCandidateEntry {
+                title: "附录".to_string(),
+                level: 1,
+                page: "".to_string(),
+            },
+            TocCandidateEntry {
+                title: "A.1".to_string(),
+                level: 1,
+                page: "300".to_string(),
+            },
+        ];
+        let entries = vec![
+            crate::model::OutlineEntry {
+                title: "附录".to_string(),
+                level: 1,
+                physical_page: 1,
+            },
+            crate::model::OutlineEntry {
+                title: "A.1".to_string(),
+                level: 1,
+                physical_page: 310,
+            },
+        ];
+
+        let backfilled = backfill_missing_entry_pages(&source_entries, &entries);
+        assert_eq!(backfilled[0].physical_page, 310);
+        assert_eq!(backfilled[1].physical_page, 310);
     }
 
     #[test]

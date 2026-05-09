@@ -86,6 +86,7 @@ Rules:
 - Use `layout_notes` for a compact summary of the page layout, reading order, and every distinct visible hierarchy style on the page.
 - Use `markdown` only for region blocks. Start each region with `## Region N (kind)` and put the region content in fenced `text` blocks.
 - Emit one visible TOC line per output line inside each `text` block.
+- Preserve the original left indentation of every TOC entry line. Do not left-align entries that have different visual indents.
 - Preserve leading spaces, indentation, hanging indents, wrapped continuation lines, and column boundaries when they help disambiguate TOC structure.
 - If the page shows multiple visible hierarchy styles, describe each style explicitly in `layout_notes`.
 - Mark unclear or unreadable fragments as `[[unclear: ...]]`.
@@ -103,7 +104,9 @@ Rules:
 - Hierarchy fidelity is the top priority. Recover every visible TOC layer that is supported by the markdown and review notes.
 - Use the markdown page boundaries, layout notes, and region content as the primary evidence.
 - Only extract entries that are explicitly supported by the markdown or the provided visual review notes.
-- Preserve title text exactly as printed, including numbering and punctuation that belong to the title.
+- Preserve title text faithfully, including numbering and punctuation that belong to the title.
+- Normalize meaningless inner spacing inside titles when it is only visual letterspacing from the scan or print layout. Examples: `思 考 题` -> `思考题`, `概 述` -> `概述`, `关 键 词` -> `关键词`.
+- Keep meaningful spaces that separate distinct tokens or scripts, such as `Verilog HDL`, `Command Line Options`, or spaces between numbering and the following title.
 - Use the smallest dense level numbers that still preserve every distinct visible hierarchy layer across the TOC.
 - If the source shows multiple indentation, numbering, alignment, or grouping styles, map them to multiple `level` values. Never flatten distinct parent and child styles into the same level.
 - If a visible parent heading and its children both appear in the TOC, output both as separate entries.
@@ -1705,10 +1708,10 @@ mod tests {
     use std::time::Instant;
 
     use super::{
-        LlmConfig, ObservedPrintedPageLabel, OutputWindow, RenderedPage,
-        TocDirectionHint, TocMarkdownTranscriptionBatch, VisionRequestConfig,
-        batch_page_range_label, bind_page_label_observations, build_openai_client,
-        display_width, identify_toc_pages, take_prefix_width, take_suffix_width,
+        LlmConfig, ObservedPrintedPageLabel, OutputWindow, RenderedPage, TocDirectionHint,
+        VisionRequestConfig, batch_page_range_label, bind_page_label_observations,
+        build_openai_client, display_width, identify_toc_pages, take_prefix_width,
+        take_suffix_width,
     };
     use crate::config::{CliArgs, resolve_args};
     use crate::model::TocPageMarkdown;

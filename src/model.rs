@@ -329,7 +329,7 @@ pub fn normalize_toc_entries(entries: Vec<TocCandidateEntry>) -> Vec<TocCandidat
     for mut entry in entries {
         let title = clean_title(&entry.title);
         let page = entry.page.trim().to_string();
-        if title.is_empty() || page.is_empty() {
+        if title.is_empty() {
             continue;
         }
 
@@ -631,6 +631,36 @@ mod tests {
         let normalized = normalize_toc_entries(entries);
         assert_eq!(normalized[0].level, 1);
         assert_eq!(normalized[1].level, 3);
+    }
+
+    #[test]
+    fn normalize_keeps_parent_headings_without_printed_pages() {
+        let entries = vec![
+            TocCandidateEntry {
+                title: "Part I".to_string(),
+                level: 1,
+                page: "".to_string(),
+            },
+            TocCandidateEntry {
+                title: "Chapter 1".to_string(),
+                level: 2,
+                page: "".to_string(),
+            },
+            TocCandidateEntry {
+                title: "1.1 Intro".to_string(),
+                level: 3,
+                page: "1".to_string(),
+            },
+        ];
+
+        let normalized = normalize_toc_entries(entries);
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[0].level, 1);
+        assert_eq!(normalized[0].page, "");
+        assert_eq!(normalized[1].level, 2);
+        assert_eq!(normalized[1].page, "");
+        assert_eq!(normalized[2].level, 3);
+        assert_eq!(normalized[2].page, "1");
     }
 
     #[test]
