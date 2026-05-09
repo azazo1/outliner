@@ -251,7 +251,7 @@ impl PdfWorkspace {
         entries
             .iter()
             .map(|entry| {
-                let page_label = crate::model::parse_page_label(&entry.page_label);
+                let page_label = crate::model::parse_page_label(&entry.page);
                 let physical_page = resolve_entry_page(
                     page_label.as_ref(),
                     offsets,
@@ -471,7 +471,7 @@ fn best_offset(scores: HashMap<isize, usize>) -> Option<isize> {
 }
 
 fn entry_label_value(entry: &TocCandidateEntry) -> Option<usize> {
-    crate::model::parse_page_label(&entry.page_label).and_then(|label| label.numeric_value())
+    crate::model::parse_page_label(&entry.page).and_then(|label| label.numeric_value())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -701,12 +701,12 @@ mod tests {
             TocCandidateEntry {
                 title: "一、概述".to_string(),
                 level: 1,
-                page_label: "1".to_string(),
+                page: "1".to_string(),
             },
             TocCandidateEntry {
                 title: "五、实践任务".to_string(),
                 level: 1,
-                page_label: "4".to_string(),
+                page: "4".to_string(),
             },
         ];
         let observations = vec![

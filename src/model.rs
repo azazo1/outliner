@@ -77,7 +77,7 @@ pub struct TocCandidateEntry {
     #[schemars(required)]
     pub level: u8,
     #[schemars(required)]
-    pub page_label: String,
+    pub page: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,8 +134,8 @@ pub fn normalize_toc_entries(entries: Vec<TocCandidateEntry>) -> Vec<TocCandidat
 
     for mut entry in entries {
         let title = clean_title(&entry.title);
-        let page_label = entry.page_label.trim().to_string();
-        if title.is_empty() || page_label.is_empty() {
+        let page = entry.page.trim().to_string();
+        if title.is_empty() || page.is_empty() {
             continue;
         }
 
@@ -168,7 +168,7 @@ pub fn normalize_toc_entries(entries: Vec<TocCandidateEntry>) -> Vec<TocCandidat
 
         entry.title = title;
         entry.level = level as u8;
-        entry.page_label = page_label;
+        entry.page = page;
         previous_level = level;
         normalized.push(entry);
     }
@@ -336,12 +336,12 @@ mod tests {
             TocCandidateEntry {
                 title: "Part I".to_string(),
                 level: 3,
-                page_label: "1".to_string(),
+                page: "1".to_string(),
             },
             TocCandidateEntry {
                 title: "Chapter 1".to_string(),
                 level: 5,
-                page_label: "3".to_string(),
+                page: "3".to_string(),
             },
         ];
 
@@ -356,22 +356,22 @@ mod tests {
             TocCandidateEntry {
                 title: "1.1 Hardware Description Language HDL".to_string(),
                 level: 1,
-                page_label: "20".to_string(),
+                page: "20".to_string(),
             },
             TocCandidateEntry {
                 title: "1.2 Verilog HDL 的历史".to_string(),
                 level: 1,
-                page_label: "21".to_string(),
+                page: "21".to_string(),
             },
             TocCandidateEntry {
                 title: "1.2.1 什么是 Verilog HDL".to_string(),
                 level: 1,
-                page_label: "21".to_string(),
+                page: "21".to_string(),
             },
             TocCandidateEntry {
                 title: "1.3 Verilog HDL 和 VHDL".to_string(),
                 level: 1,
-                page_label: "22".to_string(),
+                page: "22".to_string(),
             },
         ];
 

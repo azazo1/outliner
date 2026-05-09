@@ -42,9 +42,9 @@ Rules:
 - Output entries in reading order.
 - Copy each title exactly as printed in the table of contents.
 - Preserve numbering, prefixes, bullets, and punctuation that belong to the title, such as `六.`, `Chapter 3`, or `Appendix A`.
-- Copy page labels exactly as printed when possible. They may be arabic numbers or roman numerals.
+- Use the field `page` for the printed TOC page exactly as shown. It may be arabic digits or roman numerals, and it is not the PDF physical page number.
 - Do not paraphrase, translate, shorten, normalize, or drop any part of a title.
-- Do not invent missing titles, levels, or page labels.
+- Do not invent missing titles, levels, or `page` values.
 - Ignore running headers, footers, and body text that is not part of the table of contents.
 "#;
 
@@ -55,7 +55,7 @@ Rules:
 - The input is an extracted TOC entry sequence in reading order.
 - Keep every entry in the same order.
 - Keep every title exactly unchanged.
-- Keep every page_label exactly unchanged.
+- Keep every `page` value exactly unchanged.
 - Only adjust the level field.
 - Use global context across the full entry list. Do not reset subentries to level 1 just because a page break hid their parent on that page.
 - Use numbering patterns, chapter or section markers, and neighboring entries to infer the intended hierarchy.
@@ -177,7 +177,7 @@ pub struct VisionPageObservation {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct ObservedPrintedPageLabel {
     #[schemars(required)]
-    printed_page_label: Option<String>,
+    page: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -321,7 +321,7 @@ pub async fn observe_page_labels(
             )
         },
         merge_vision_observation_batches,
-        "You inspect PDF page images. Return one observation per input page image, in the same order as the input. For each page image, detect the visible printed page label if one is clearly present in the page header or footer. Use the exact visible label, usually digits or roman numerals. If no printed page label is visible, use null. Prefer the schema field `observations`, and each observation should use the field `printed_page_label`. Do not return physical page numbers.",
+        "You inspect PDF page images. Return one observation per input page image, in the same order as the input. For each page image, detect the visible printed page label if one is clearly present in the page header or footer. Use the exact visible label, usually digits or roman numerals. If no printed page label is visible, use null. Prefer the schema field `observations`, and each observation should use the field `page` for that visible label, not the PDF physical page number.",
         progress_span,
         progress_label,
     )
@@ -464,7 +464,7 @@ fn bind_page_label_observations(
             physical_page: page.physical_page,
             printed_page_label: observations
                 .get(index)
-                .and_then(|observation| observation.printed_page_label.clone()),
+                .and_then(|observation| observation.page.clone()),
         })
         .collect()
 }
@@ -1293,10 +1293,10 @@ mod tests {
         ];
         let observations = vec![
             ObservedPrintedPageLabel {
-                printed_page_label: Some("1".to_string()),
+                page: Some("1".to_string()),
             },
             ObservedPrintedPageLabel {
-                printed_page_label: Some("4".to_string()),
+                page: Some("4".to_string()),
             },
         ];
 

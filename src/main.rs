@@ -1071,20 +1071,20 @@ fn reconcile_toc_hierarchy_entries(
 
     let mut reconciled = Vec::with_capacity(original_entries.len());
     for (original, reorganized) in original_entries.iter().zip(reorganized_entries) {
-        if original.title != reorganized.title || original.page_label != reorganized.page_label {
+        if original.title != reorganized.title || original.page != reorganized.page {
             tracing::warn!(
                 original_title = %original.title,
                 reorganized_title = %reorganized.title,
-                original_page_label = %original.page_label,
-                reorganized_page_label = %reorganized.page_label,
-                "organized TOC entry changed title or page label; falling back to original extraction"
+                original_page = %original.page,
+                reorganized_page = %reorganized.page,
+                "organized TOC entry changed title or page; falling back to original extraction"
             );
             return original_entries.to_vec();
         }
 
         reconciled.push(TocCandidateEntry {
             title: original.title.clone(),
-            page_label: original.page_label.clone(),
+            page: original.page.clone(),
             level: reorganized.level.max(1),
         });
     }
@@ -1213,18 +1213,18 @@ mod tests {
         let original = vec![TocCandidateEntry {
             title: "1.1 HDL".to_string(),
             level: 1,
-            page_label: "20".to_string(),
+            page: "20".to_string(),
         }];
         let reorganized = vec![TocCandidateEntry {
             title: "1.1 Verilog HDL".to_string(),
             level: 2,
-            page_label: "20".to_string(),
+            page: "20".to_string(),
         }];
 
         let reconciled = reconcile_toc_hierarchy_entries(&original, reorganized);
         assert_eq!(reconciled.len(), 1);
         assert_eq!(reconciled[0].title, original[0].title);
-        assert_eq!(reconciled[0].page_label, original[0].page_label);
+        assert_eq!(reconciled[0].page, original[0].page);
         assert_eq!(reconciled[0].level, original[0].level);
     }
 
@@ -1234,24 +1234,24 @@ mod tests {
             TocCandidateEntry {
                 title: "1.2 Verilog HDL 的历史".to_string(),
                 level: 1,
-                page_label: "21".to_string(),
+                page: "21".to_string(),
             },
             TocCandidateEntry {
                 title: "1.2.1 什么是 Verilog HDL".to_string(),
                 level: 1,
-                page_label: "21".to_string(),
+                page: "21".to_string(),
             },
         ];
         let reorganized = vec![
             TocCandidateEntry {
                 title: "1.2 Verilog HDL 的历史".to_string(),
                 level: 1,
-                page_label: "21".to_string(),
+                page: "21".to_string(),
             },
             TocCandidateEntry {
                 title: "1.2.1 什么是 Verilog HDL".to_string(),
                 level: 2,
-                page_label: "21".to_string(),
+                page: "21".to_string(),
             },
         ];
 
