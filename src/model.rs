@@ -181,14 +181,14 @@ pub struct TocExtraction {
     pub toc_found: bool,
     #[schemars(
         required,
-        description = "The first table of content (TOC) page as a 1-based PDF physical page number. This is not the printed page label shown inside the book. Use a positive integer within the provided TOC document page range. Never use 0 or a negative value. Should not be null when toc_found is true. It's provided by `# TOC Page <N>`."
+        description = "The first TOC page, it refers to TOC itself's position in the whole pdf, not the TOC containing range. It's provided in `# TOC Page <N>`."
     )]
-    pub toc_start_page: Option<usize>,
+    pub first_toc_page: Option<usize>,
     #[schemars(
         required,
-        description = "Same with toc_start_page, but the last TOC page."
+        description = "Same with first_toc_page, but the last TOC page."
     )]
-    pub toc_end_page: Option<usize>,
+    pub last_toc_page: Option<usize>,
     #[schemars(required)]
     pub entries: Vec<TocCandidateEntry>,
     #[schemars(required)]

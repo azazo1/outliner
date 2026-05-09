@@ -535,8 +535,8 @@ async fn run(args: AppArgs, trace_recorder: &DebugTraceRecorder) -> Result<RunOu
     tracing::info!(
         toc_found = extracted.toc_found,
         entry_count = extracted.entries.len(),
-        toc_start_page = ?extracted.toc_start_page,
-        toc_end_page = ?extracted.toc_end_page,
+        first_toc_page = ?extracted.first_toc_page,
+        last_toc_page = ?extracted.last_toc_page,
         "TOC extracted from markdown"
     );
     finish_stage(

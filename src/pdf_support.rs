@@ -137,7 +137,7 @@ impl PdfWorkspace {
     }
 
     pub fn toc_heading_page(&self, extracted_toc: &crate::model::TocExtraction) -> Option<usize> {
-        extracted_toc.toc_start_page
+        extracted_toc.first_toc_page
     }
 
     pub fn label_sample_pages(
