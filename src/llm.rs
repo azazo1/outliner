@@ -1,11 +1,11 @@
 use anyhow::{Context, Result, bail};
 use base64::{Engine, prelude::BASE64_STANDARD};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use http::{HeaderMap, StatusCode};
 use rig::OneOrMany;
 use rig::agent::MultiTurnStreamItem;
 use rig::client::completion::CompletionClient;
-use rig::completion::{CompletionError, Prompt, PromptError, Usage};
+use rig::completion::{CompletionError, PromptError, Usage};
 use rig::extractor::ExtractionResponse;
 use rig::http_client;
 use rig::message::{
@@ -1029,6 +1029,10 @@ fn llm_retry_wait_label(
     )
 }
 
+fn repair_progress_label(progress_label: &str) -> String {
+    format!("{progress_label} | repairing")
+}
+
 fn llm_retry_delay(failed_attempt: usize) -> Duration {
     let shift = failed_attempt.saturating_sub(1).min(20) as u32;
     let delay_ms = INITIAL_LLM_RETRY_DELAY_MS
@@ -1160,7 +1164,72 @@ where
         .preamble(preamble)
         .output_schema::<T>()
         .build();
-    let mut stream = agent.stream_prompt(prompt).await;
+    let (final_text, mut usage) = collect_stream_text(
+        agent.stream_prompt(prompt).await,
+        progress_span,
+        progress_label,
+    )
+    .await?;
+
+    let (data, repaired_output, repair_usage, repair_trace) = match serde_json::from_str::<T>(
+        &final_text,
+    ) {
+        Ok(data) => (data, None, Usage::new(), None),
+        Err(initial_error) => {
+            let (repaired_json, repair_usage, repair_trace) = repair_structured_output::<T>(
+                client,
+                model,
+                &final_text,
+                progress_span,
+                progress_label,
+            )
+            .await?;
+            let repaired_value = serde_json::from_str::<serde_json::Value>(&repaired_json).with_context(|| {
+                format!(
+                    "failed to parse repaired structured response as JSON value. original: {final_text}; repaired: {}; initial error: {initial_error}",
+                    repaired_json
+                )
+            })?;
+            let data = serde_json::from_value(repaired_value).with_context(|| {
+                format!(
+                    "failed to deserialize structured response after repair. original: {final_text}; repaired: {}; initial error: {initial_error}",
+                    repaired_json
+                )
+            })?;
+            (data, Some(repaired_json), repair_usage, Some(repair_trace))
+        }
+    };
+    usage += repair_usage;
+    let response: ExtractionResponse<T> = ExtractionResponse { data, usage };
+    let structured_output = serde_json::to_string_pretty(&response.data)
+        .context("failed to serialize structured output trace")?;
+
+    let trace = StructuredOutputTrace {
+        raw_output: final_text,
+        repaired_output,
+        structured_output,
+        duration_ms: started_at.elapsed().as_millis() as u64,
+        repair_trace,
+    };
+
+    Ok((response, trace))
+}
+
+#[derive(Debug, Clone)]
+struct TextResponse {
+    output: String,
+    usage: Usage,
+}
+
+async fn collect_stream_text<S, R, E>(
+    mut stream: S,
+    progress_span: Option<&Span>,
+    progress_label: &str,
+) -> Result<(String, Usage)>
+where
+    S: Stream<Item = std::result::Result<MultiTurnStreamItem<R>, E>> + Unpin,
+    E: std::error::Error + Send + Sync + 'static,
+{
     let mut output_chars = 0usize;
     let mut streamed_text = String::new();
     let mut final_text = String::new();
@@ -1207,42 +1276,7 @@ where
         &output_window.render(),
     );
 
-    let (data, repaired_output, repair_usage, repair_trace) = match serde_json::from_str::<T>(
-        &final_text,
-    ) {
-        Ok(data) => (data, None, Usage::new(), None),
-        Err(initial_error) => {
-            let (repaired_json, repair_usage, repair_trace) =
-                repair_structured_output::<T>(client, model, &final_text).await?;
-            let repaired_value = serde_json::from_str::<serde_json::Value>(&repaired_json).with_context(|| {
-                format!(
-                    "failed to parse repaired structured response as JSON value. original: {final_text}; repaired: {}; initial error: {initial_error}",
-                    repaired_json
-                )
-            })?;
-            let data = serde_json::from_value(repaired_value).with_context(|| {
-                format!(
-                    "failed to deserialize structured response after repair. original: {final_text}; repaired: {}; initial error: {initial_error}",
-                    repaired_json
-                )
-            })?;
-            (data, Some(repaired_json), repair_usage, Some(repair_trace))
-        }
-    };
-    usage += repair_usage;
-    let response: ExtractionResponse<T> = ExtractionResponse { data, usage };
-    let structured_output = serde_json::to_string_pretty(&response.data)
-        .context("failed to serialize structured output trace")?;
-
-    let trace = StructuredOutputTrace {
-        raw_output: final_text,
-        repaired_output,
-        structured_output,
-        duration_ms: started_at.elapsed().as_millis() as u64,
-        repair_trace,
-    };
-
-    Ok((response, trace))
+    Ok((final_text, usage))
 }
 
 #[expect(
@@ -1748,6 +1782,8 @@ async fn repair_structured_output<T>(
     client: &openai::CompletionsClient,
     model: &str,
     invalid_output: &str,
+    progress_span: Option<&Span>,
+    progress_label: &str,
 ) -> Result<(String, Usage, RepairTrace)>
 where
     T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
@@ -1761,21 +1797,32 @@ where
         ))])
         .context("repair prompt cannot be empty")?,
     };
+    let repair_label = repair_progress_label(progress_label);
     let (repaired, _) = retry_llm_operation(
-        None,
-        "repair malformed structured output",
+        progress_span,
+        &repair_label,
         "structured output repair",
-        |_| async {
-            client
-                .agent(model)
-                .preamble(
-                    "You repair malformed structured outputs. Return only valid JSON that conforms exactly to the provided schema.",
+        |attempt| {
+            let client = client.clone();
+            let prompt = repair_prompt.clone();
+            let attempt_label =
+                llm_attempt_progress_label(&repair_label, attempt, MAX_LLM_ATTEMPTS);
+            async move {
+                let agent = client
+                    .agent(model)
+                    .preamble(
+                        "You repair malformed structured outputs. Return only valid JSON that conforms exactly to the provided schema.",
+                    )
+                    .build();
+                let (output, usage) = collect_stream_text(
+                    agent.stream_prompt(prompt).await,
+                    progress_span,
+                    &attempt_label,
                 )
-                .build()
-                .prompt(repair_prompt.clone())
-                .extended_details()
                 .await
-                .context("failed to repair malformed structured output")
+                .context("failed to repair malformed structured output")?;
+                Ok(TextResponse { output, usage })
+            }
         },
     )
     .await?;
@@ -2117,7 +2164,8 @@ mod tests {
         TocPageAssessmentAnswer, TocPageMarkdownAnswer, VisionRequestConfig, VisualReviewAnswer,
         batch_page_range_label, bind_page_label_observations, bind_toc_markdown_pages,
         bind_toc_page_assessments, bind_visual_review_results, build_openai_client, display_width,
-        identify_toc_pages, should_retry_llm_error, take_prefix_width, take_suffix_width,
+        identify_toc_pages, repair_progress_label, should_retry_llm_error, take_prefix_width,
+        take_suffix_width,
     };
     use crate::config::{CliArgs, resolve_args};
     use crate::model::{TocPageEvidence, TocPageMarkdown, VisualReviewRequest};
@@ -2212,6 +2260,14 @@ mod tests {
             ),
         ));
         assert!(!should_retry_llm_error(&error));
+    }
+
+    #[test]
+    fn repair_progress_label_appends_stage_marker() {
+        assert_eq!(
+            repair_progress_label("extracting TOC from markdown"),
+            "extracting TOC from markdown | repairing"
+        );
     }
 
     #[tokio::test]
