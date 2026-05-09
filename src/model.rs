@@ -388,9 +388,7 @@ pub fn markdown_context_budget_exceeded(markdown: &str) -> bool {
     markdown.chars().count() > 120_000
 }
 
-pub fn format_toc_review_appendix(
-    review_results: &[VisualReviewResult],
-) -> Option<String> {
+pub fn format_toc_review_appendix(review_results: &[VisualReviewResult]) -> Option<String> {
     if review_results.is_empty() {
         return None;
     }
@@ -484,9 +482,10 @@ fn lookup_numbering_level(
     level_map: &[(SectionNumbering, usize)],
     numbering: &SectionNumbering,
 ) -> Option<usize> {
-    level_map.iter().rev().find_map(|(mapped, level)| {
-        (mapped == numbering).then_some(*level)
-    })
+    level_map
+        .iter()
+        .rev()
+        .find_map(|(mapped, level)| (mapped == numbering).then_some(*level))
 }
 
 fn remember_numbering_level(

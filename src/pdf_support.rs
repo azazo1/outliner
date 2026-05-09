@@ -557,22 +557,17 @@ where
     }
 
     let worker_count = concurrency.max(1).min(pages.len());
-    let mut pending = stream::iter(
-        pages
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(index, physical_page)| {
-                let pdf_path = pdf_path.clone();
-                async move {
-                    let output =
-                        tokio::task::spawn_blocking(move || worker(pdf_path, physical_page))
-                            .await
-                            .context("page worker panicked")??;
-                    Ok::<_, anyhow::Error>((index, physical_page, output))
-                }
-            }),
-    )
+    let mut pending = stream::iter(pages.iter().copied().enumerate().map(
+        |(index, physical_page)| {
+            let pdf_path = pdf_path.clone();
+            async move {
+                let output = tokio::task::spawn_blocking(move || worker(pdf_path, physical_page))
+                    .await
+                    .context("page worker panicked")??;
+                Ok::<_, anyhow::Error>((index, physical_page, output))
+            }
+        },
+    ))
     .buffer_unordered(worker_count);
 
     let mut completed = 0;
@@ -701,10 +696,7 @@ mod tests {
     fn sample_pages_prioritizes_dense_front_pages_for_discovery() {
         let pages = sample_discovery_pages(PageRange::new(1, 72).expect("range"));
 
-        assert_eq!(
-            pages,
-            vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 18, 20, 22]
-        );
+        assert_eq!(pages, vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 18, 20, 22]);
     }
 
     #[test]
@@ -949,7 +941,10 @@ mod tests {
             },
             move |completed, physical_page| {
                 assert!((1..=3).contains(&completed));
-                progress_pages.lock().expect("progress mutex").push(physical_page);
+                progress_pages
+                    .lock()
+                    .expect("progress mutex")
+                    .push(physical_page);
             },
         )
         .await

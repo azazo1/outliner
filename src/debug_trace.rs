@@ -9,8 +9,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::model::{
-    DebugTraceArtifactRecord, DebugTraceLlmCallRecord, DebugTraceManifest,
-    DebugTraceOutcomeRecord, DebugTraceStageRecord, RunOutcome,
+    DebugTraceArtifactRecord, DebugTraceLlmCallRecord, DebugTraceManifest, DebugTraceOutcomeRecord,
+    DebugTraceStageRecord, RunOutcome,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -110,8 +110,8 @@ impl DebugTraceRecorder {
         };
 
         let stage_path = inner.root.join("stages").join(stage_filename);
-        let stage_bytes = serde_json::to_vec_pretty(&record)
-            .context("failed to serialize stage trace record")?;
+        let stage_bytes =
+            serde_json::to_vec_pretty(&record).context("failed to serialize stage trace record")?;
         fs::write(&stage_path, stage_bytes)
             .with_context(|| format!("failed to write stage trace {}", stage_path.display()))?;
         self.write_manifest()
@@ -216,15 +216,21 @@ impl DebugTraceRecorder {
         let artifact_path = inner.root.join(&relative_path);
 
         if !artifact_path.exists() {
-            fs::write(&artifact_path, bytes)
-                .with_context(|| format!("failed to write trace artifact {}", artifact_path.display()))?;
+            fs::write(&artifact_path, bytes).with_context(|| {
+                format!("failed to write trace artifact {}", artifact_path.display())
+            })?;
         }
 
         let mut state = inner
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("trace state lock poisoned"))?;
-        if !state.manifest.artifacts.iter().any(|artifact| artifact.id == id) {
+        if !state
+            .manifest
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.id == id)
+        {
             state.manifest.artifacts.push(DebugTraceArtifactRecord {
                 id: id.clone(),
                 kind: kind.to_string(),
@@ -278,8 +284,8 @@ mod tests {
 
     use super::DebugTraceRecorder;
     use crate::model::{
-        DebugTraceLlmCallRecord, DebugTraceLlmOutputRecord, DebugTraceMessagePartRecord,
-        DebugTraceMessageRecord, DebugTraceManifest, DebugTraceStageRecord,
+        DebugTraceLlmCallRecord, DebugTraceLlmOutputRecord, DebugTraceManifest,
+        DebugTraceMessagePartRecord, DebugTraceMessageRecord, DebugTraceStageRecord,
         DebugTraceUsageSnapshot, RunOutcome,
     };
     use rig::completion::Usage;
@@ -370,11 +376,13 @@ mod tests {
             .expect("record llm call");
 
         let manifest_path = recorder.root().expect("root").join("manifest.json");
-        let manifest: DebugTraceManifest = serde_json::from_slice(
-            &fs::read(manifest_path).expect("read manifest"),
-        )
-        .expect("parse manifest");
+        let manifest: DebugTraceManifest =
+            serde_json::from_slice(&fs::read(manifest_path).expect("read manifest"))
+                .expect("parse manifest");
         assert_eq!(manifest.llm_calls.len(), 1);
-        assert_eq!(manifest.llm_calls[0].stage_name, "extract_toc_from_markdown");
+        assert_eq!(
+            manifest.llm_calls[0].stage_name,
+            "extract_toc_from_markdown"
+        );
     }
 }

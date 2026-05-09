@@ -22,15 +22,15 @@ use crate::{
     config::{AppArgs, CliArgs, resolve_args},
     debug_trace::DebugTraceRecorder,
     llm::{
-        LlmCall, LlmConfig, TocPageAssessmentBatch, VisionRequestConfig, VisionPageObservation,
+        LlmCall, LlmConfig, TocPageAssessmentBatch, VisionPageObservation, VisionRequestConfig,
         extract_toc_from_markdown, identify_toc_pages, infer_toc_from_page_text,
         observe_page_labels, review_toc_visual_gaps, transcribe_toc_pages_to_markdown,
     },
     model::{
-        DebugTraceStageRecord, DebugTraceUsageSnapshot, ExtractedPageText, OutlineEntry,
-        PageRange, RenderedPage, RunOutcome, TocMarkdownDocument, TocPageEvidence,
-        TocPageMarkdown, VisualReviewRequest, markdown_context_budget_exceeded,
-        normalize_outline_for_compare, normalize_toc_entries,
+        DebugTraceStageRecord, DebugTraceUsageSnapshot, ExtractedPageText, OutlineEntry, PageRange,
+        RenderedPage, RunOutcome, TocMarkdownDocument, TocPageEvidence, TocPageMarkdown,
+        VisualReviewRequest, markdown_context_budget_exceeded, normalize_outline_for_compare,
+        normalize_toc_entries,
     },
     pdf_support::{PdfWorkspace, is_toc_hit},
     progress::{
@@ -455,12 +455,8 @@ async fn run(args: AppArgs, trace_recorder: &DebugTraceRecorder) -> Result<RunOu
             agent_progress.calls,
         );
         let review_pages = review_prefetch_pages(&initial_extracted.review_requests);
-        let rendered_review_pages = collect_review_rendered_pages(
-            &workspace,
-            &rendered_toc_pages,
-            &review_pages,
-        )
-        .await?;
+        let rendered_review_pages =
+            collect_review_rendered_pages(&workspace, &rendered_toc_pages, &review_pages).await?;
         record_rendered_page_stage(
             trace_recorder,
             "render_review_pages",
@@ -469,7 +465,10 @@ async fn run(args: AppArgs, trace_recorder: &DebugTraceRecorder) -> Result<RunOu
         )?;
         let review_span = start_spinner(
             "review_toc_visual_gaps",
-            format!("reviewing TOC pages {}", format_rendered_page_range(&rendered_review_pages)),
+            format!(
+                "reviewing TOC pages {}",
+                format_rendered_page_range(&rendered_review_pages)
+            ),
         );
         let review_message = format!(
             "reviewing TOC pages {}",
@@ -1168,10 +1167,7 @@ async fn try_discover_toc_range_from_text(
     );
     let infer_span = start_spinner("infer_toc_from_text", infer_message.clone());
     let LlmCall {
-        data,
-        usage,
-        calls,
-        ..
+        data, usage, calls, ..
     } = infer_toc_from_page_text(
         llm_config,
         &extracted_pages,
@@ -1272,18 +1268,17 @@ fn build_toc_page_evidence(
 
     rendered_pages
         .iter()
-        .map(|rendered_page| {
-            TocPageEvidence {
-                physical_page: rendered_page.physical_page,
-                pdf_text: extracted_by_page.get(&rendered_page.physical_page).cloned(),
-                rendered_page: rendered_page.clone(),
-            }
+        .map(|rendered_page| TocPageEvidence {
+            physical_page: rendered_page.physical_page,
+            pdf_text: extracted_by_page.get(&rendered_page.physical_page).cloned(),
+            rendered_page: rendered_page.clone(),
         })
         .collect()
 }
 
 fn summarize_extracted_pages(pages: &[ExtractedPageText]) -> String {
-    pages.iter()
+    pages
+        .iter()
         .map(|page| {
             format!(
                 "PDF physical page {}\n---BEGIN TEXT---\n{}\n---END TEXT---",
@@ -1295,7 +1290,8 @@ fn summarize_extracted_pages(pages: &[ExtractedPageText]) -> String {
 }
 
 fn summarize_toc_evidence(pages: &[TocPageEvidence]) -> String {
-    pages.iter()
+    pages
+        .iter()
         .map(|page| {
             format!(
                 "PDF physical page {}\n[pdf_text]\n{}",
@@ -1353,7 +1349,12 @@ fn record_text_stage(
     }
     trace_recorder.record_stage(DebugTraceStageRecord {
         stage_name: stage_name.to_string(),
-        page_range: page_range_from_numbers(&pages.iter().map(|page| page.physical_page).collect::<Vec<_>>()),
+        page_range: page_range_from_numbers(
+            &pages
+                .iter()
+                .map(|page| page.physical_page)
+                .collect::<Vec<_>>(),
+        ),
         worker: None,
         artifact_refs,
         usage: DebugTraceUsageSnapshot::from_usage(usage),
@@ -1371,8 +1372,8 @@ fn record_toc_evidence_stage(
     }
 
     let mut artifact_refs = Vec::new();
-    if let Some(artifact_ref) =
-        trace_recorder.record_text_artifact("toc_page_evidence", &summarize_toc_evidence(evidence_pages))?
+    if let Some(artifact_ref) = trace_recorder
+        .record_text_artifact("toc_page_evidence", &summarize_toc_evidence(evidence_pages))?
     {
         artifact_refs.push(artifact_ref);
     }
@@ -1408,7 +1409,10 @@ fn record_toc_markdown_stage(
     trace_recorder.record_stage(DebugTraceStageRecord {
         stage_name: stage_name.to_string(),
         page_range: page_range_from_numbers(
-            &pages.iter().map(|page| page.physical_page).collect::<Vec<_>>(),
+            &pages
+                .iter()
+                .map(|page| page.physical_page)
+                .collect::<Vec<_>>(),
         ),
         worker: None,
         artifact_refs,
@@ -1427,10 +1431,9 @@ fn record_toc_markdown_document_stage(
     }
 
     let mut artifact_refs = Vec::new();
-    if let Some(artifact_ref) = trace_recorder.record_text_artifact(
-        "toc_markdown_document",
-        &document.combined_markdown,
-    )? {
+    if let Some(artifact_ref) =
+        trace_recorder.record_text_artifact("toc_markdown_document", &document.combined_markdown)?
+    {
         artifact_refs.push(artifact_ref);
     }
     trace_recorder.record_stage(DebugTraceStageRecord {
@@ -1490,11 +1493,14 @@ fn record_visual_review_stage(
     }
 
     let mut artifact_refs = Vec::new();
-    if let Some(artifact_ref) = trace_recorder.record_json_artifact("toc_review_requests", &requests)?
+    if let Some(artifact_ref) =
+        trace_recorder.record_json_artifact("toc_review_requests", &requests)?
     {
         artifact_refs.push(artifact_ref);
     }
-    if let Some(artifact_ref) = trace_recorder.record_json_artifact("toc_review_results", &results)? {
+    if let Some(artifact_ref) =
+        trace_recorder.record_json_artifact("toc_review_results", &results)?
+    {
         artifact_refs.push(artifact_ref);
     }
     trace_recorder.record_stage(DebugTraceStageRecord {
@@ -1639,8 +1645,7 @@ fn is_toc_heading_title(title: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_toc_heading_entry, format_rendered_page_range, is_toc_heading_title,
-        stage_count_for,
+        ensure_toc_heading_entry, format_rendered_page_range, is_toc_heading_title, stage_count_for,
     };
     use crate::{
         config::AppArgs,

@@ -26,6 +26,7 @@ use std::{
 use tracing::Span;
 use unicode_width::UnicodeWidthChar;
 
+use crate::progress::{set_spinner_message, start_spinner};
 use crate::{
     debug_trace::DebugTraceRecorder,
     model::{
@@ -35,7 +36,6 @@ use crate::{
         VisualReviewResult, format_toc_review_appendix,
     },
 };
-use crate::progress::{set_spinner_message, start_spinner};
 
 const OUTPUT_WINDOW_LEN: usize = 44;
 const MAX_SCROLL_CHARS_PER_SECOND: f64 = 180.0;
@@ -425,8 +425,9 @@ pub async fn transcribe_toc_pages_to_markdown(
                 .await?;
 
                 let finished_batches = completed_batches.fetch_add(1, Ordering::Relaxed) + 1;
-                let finished_pages =
-                    completed_pages.fetch_add(batch.pages.len(), Ordering::Relaxed) + batch.pages.len();
+                let finished_pages = completed_pages
+                    .fetch_add(batch.pages.len(), Ordering::Relaxed)
+                    + batch.pages.len();
                 update_batch_progress(
                     parent_span.as_ref(),
                     &progress_label,
@@ -886,7 +887,9 @@ where
         &output_window.render(),
     );
 
-    let (data, repaired_output, repair_usage, repair_trace) = match serde_json::from_str::<T>(&final_text) {
+    let (data, repaired_output, repair_usage, repair_trace) = match serde_json::from_str::<T>(
+        &final_text,
+    ) {
         Ok(data) => (data, None, Usage::new(), None),
         Err(initial_error) => {
             let (repaired_json, repair_usage, repair_trace) =
@@ -1497,18 +1500,18 @@ fn record_llm_call_trace(
             page_range: page_range.clone(),
             messages: vec![
                 DebugTraceMessageRecord {
-                role: "system".to_string(),
-                parts: vec![DebugTraceMessagePartRecord {
-                    kind: "text".to_string(),
-                    artifact_ref: recorder.record_text_artifact(
-                        "llm_repair_system_message",
-                        &repair_trace.preamble,
-                    )?,
-                    text: None,
-                    media_type: None,
-                    detail: None,
-                }],
-            },
+                    role: "system".to_string(),
+                    parts: vec![DebugTraceMessagePartRecord {
+                        kind: "text".to_string(),
+                        artifact_ref: recorder.record_text_artifact(
+                            "llm_repair_system_message",
+                            &repair_trace.preamble,
+                        )?,
+                        text: None,
+                        media_type: None,
+                        detail: None,
+                    }],
+                },
                 convert_message_for_trace(recorder, &repair_trace.prompt)?,
                 DebugTraceMessageRecord {
                     role: "assistant".to_string(),
@@ -1661,17 +1664,33 @@ fn convert_image_for_trace(
         kind: "image".to_string(),
         artifact_ref,
         text: None,
-        media_type: image.media_type.as_ref().map(|ty| format!("{ty:?}").to_ascii_lowercase()),
-        detail: image.detail.as_ref().map(|detail| format!("{detail:?}").to_ascii_lowercase()),
+        media_type: image
+            .media_type
+            .as_ref()
+            .map(|ty| format!("{ty:?}").to_ascii_lowercase()),
+        detail: image
+            .detail
+            .as_ref()
+            .map(|detail| format!("{detail:?}").to_ascii_lowercase()),
     })
 }
 
 fn page_range_from_rendered_pages(pages: &[RenderedPage]) -> Option<String> {
-    page_range_from_numbers(&pages.iter().map(|page| page.physical_page).collect::<Vec<_>>())
+    page_range_from_numbers(
+        &pages
+            .iter()
+            .map(|page| page.physical_page)
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn page_range_from_extracted_pages(pages: &[ExtractedPageText]) -> Option<String> {
-    page_range_from_numbers(&pages.iter().map(|page| page.physical_page).collect::<Vec<_>>())
+    page_range_from_numbers(
+        &pages
+            .iter()
+            .map(|page| page.physical_page)
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn page_range_from_toc_markdown_document(document: &TocMarkdownDocument) -> Option<String> {
