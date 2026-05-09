@@ -9,8 +9,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::model::{
-    DebugTraceArtifactRecord, DebugTraceManifest, DebugTraceOutcomeRecord, DebugTraceStageRecord,
-    RunOutcome,
+    DebugTraceArtifactRecord, DebugTraceLlmCallRecord, DebugTraceManifest,
+    DebugTraceOutcomeRecord, DebugTraceStageRecord, RunOutcome,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -28,6 +28,7 @@ struct DebugTraceRecorderInner {
 struct DebugTraceState {
     manifest: DebugTraceManifest,
     next_stage_index: usize,
+    next_call_index: usize,
 }
 
 impl DebugTraceRecorder {
@@ -49,10 +50,12 @@ impl DebugTraceRecorder {
                         input_path: input_path.display().to_string(),
                         output_path: None,
                         stage_records: Vec::new(),
+                        llm_calls: Vec::new(),
                         artifacts: Vec::new(),
                         final_outcome: None,
                     },
                     next_stage_index: 0,
+                    next_call_index: 0,
                 }),
             })),
         };
@@ -112,6 +115,37 @@ impl DebugTraceRecorder {
         fs::write(&stage_path, stage_bytes)
             .with_context(|| format!("failed to write stage trace {}", stage_path.display()))?;
         self.write_manifest()
+    }
+
+    pub fn record_llm_call(&self, mut record: DebugTraceLlmCallRecord) -> Result<Option<String>> {
+        let Some(inner) = &self.inner else {
+            return Ok(None);
+        };
+
+        let (call_id, call_filename) = {
+            let mut state = inner
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("trace state lock poisoned"))?;
+            state.next_call_index += 1;
+            let call_id = format!("call_{:04}", state.next_call_index);
+            let filename = format!(
+                "{:04}_{}.json",
+                state.next_call_index,
+                sanitize_stage_name(&record.stage_name)
+            );
+            record.call_id = call_id.clone();
+            state.manifest.llm_calls.push(record.clone());
+            (call_id, filename)
+        };
+
+        let call_path = inner.root.join("stages").join(call_filename);
+        let call_bytes = serde_json::to_vec_pretty(&record)
+            .context("failed to serialize llm call trace record")?;
+        fs::write(&call_path, call_bytes)
+            .with_context(|| format!("failed to write llm call trace {}", call_path.display()))?;
+        self.write_manifest()?;
+        Ok(Some(call_id))
     }
 
     pub fn record_outcome(&self, outcome: &RunOutcome) -> Result<()> {
@@ -238,12 +272,17 @@ fn sanitize_stage_name(stage_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
     use tempfile::TempDir;
 
     use super::DebugTraceRecorder;
-    use crate::model::{DebugTraceStageRecord, DebugTraceUsageSnapshot, RunOutcome};
+    use crate::model::{
+        DebugTraceLlmCallRecord, DebugTraceLlmOutputRecord, DebugTraceMessagePartRecord,
+        DebugTraceMessageRecord, DebugTraceManifest, DebugTraceStageRecord,
+        DebugTraceUsageSnapshot, RunOutcome,
+    };
     use rig::completion::Usage;
-    use std::path::PathBuf;
 
     #[test]
     fn repeated_artifacts_are_deduplicated() {
@@ -293,5 +332,49 @@ mod tests {
 
         let manifest_path = recorder.root().expect("root").join("manifest.json");
         assert!(manifest_path.exists());
+    }
+
+    #[test]
+    fn manifest_records_llm_calls() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let recorder = DebugTraceRecorder::new(
+            temp_dir.path().join("trace"),
+            PathBuf::from("book.pdf").as_path(),
+        )
+        .expect("trace recorder");
+
+        recorder
+            .record_llm_call(DebugTraceLlmCallRecord {
+                call_id: String::new(),
+                stage_name: "extract_toc_from_markdown".to_string(),
+                worker: Some("worker 1/1".to_string()),
+                page_range: Some("3..5".to_string()),
+                messages: vec![DebugTraceMessageRecord {
+                    role: "user".to_string(),
+                    parts: vec![DebugTraceMessagePartRecord {
+                        kind: "text".to_string(),
+                        artifact_ref: None,
+                        text: Some("hello".to_string()),
+                        media_type: None,
+                        detail: None,
+                    }],
+                }],
+                output: DebugTraceLlmOutputRecord {
+                    raw_output_ref: None,
+                    repaired_output_ref: None,
+                    structured_output_ref: None,
+                },
+                usage: DebugTraceUsageSnapshot::from_usage(&Usage::new()),
+                duration_ms: Some(12),
+            })
+            .expect("record llm call");
+
+        let manifest_path = recorder.root().expect("root").join("manifest.json");
+        let manifest: DebugTraceManifest = serde_json::from_slice(
+            &fs::read(manifest_path).expect("read manifest"),
+        )
+        .expect("parse manifest");
+        assert_eq!(manifest.llm_calls.len(), 1);
+        assert_eq!(manifest.llm_calls[0].stage_name, "extract_toc_from_markdown");
     }
 }

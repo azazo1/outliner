@@ -5,9 +5,11 @@ use http::HeaderMap;
 use rig::OneOrMany;
 use rig::agent::MultiTurnStreamItem;
 use rig::client::completion::CompletionClient;
-use rig::completion::{TypedPrompt, Usage};
+use rig::completion::{Prompt, Usage};
 use rig::extractor::ExtractionResponse;
-use rig::message::{Image, ImageDetail, ImageMediaType, Message, UserContent};
+use rig::message::{
+    AssistantContent, DocumentSourceKind, Image, ImageDetail, ImageMediaType, Message, UserContent,
+};
 use rig::providers::openai;
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 use schemars::JsonSchema;
@@ -27,7 +29,8 @@ use unicode_width::UnicodeWidthChar;
 use crate::{
     debug_trace::DebugTraceRecorder,
     model::{
-        DebugTraceStageRecord, DebugTraceUsageSnapshot, ExtractedPageText, RenderedPage,
+        DebugTraceLlmCallRecord, DebugTraceLlmOutputRecord, DebugTraceMessagePartRecord,
+        DebugTraceMessageRecord, DebugTraceUsageSnapshot, ExtractedPageText, RenderedPage,
         TocExtraction, TocMarkdownDocument, TocPageEvidence, TocPageMarkdown, VisualReviewRequest,
         VisualReviewResult, format_toc_review_appendix,
     },
@@ -78,13 +81,17 @@ You transcribe PDF table-of-contents pages into high-fidelity markdown page reco
 
 Rules:
 - Return one page record per input page, in the same order.
+- Hierarchy fidelity is the top priority. Preserve every visible hierarchy cue that distinguishes parent, child, and sibling entries.
 - Preserve all TOC-relevant detail, including indentation, dot leaders, numbering, page labels, column order, boxed headings, side notes, and unusual layout cues.
-- Use `layout_notes` for a compact summary of the page layout and reading order.
+- Use `layout_notes` for a compact summary of the page layout, reading order, and every distinct visible hierarchy style on the page.
 - Use `markdown` only for region blocks. Start each region with `## Region N (kind)` and put the region content in fenced `text` blocks.
-- Keep visual separators and line breaks when they help disambiguate TOC structure.
+- Emit one visible TOC line per output line inside each `text` block.
+- Preserve leading spaces, indentation, hanging indents, wrapped continuation lines, and column boundaries when they help disambiguate TOC structure.
+- If the page shows multiple visible hierarchy styles, describe each style explicitly in `layout_notes`.
 - Mark unclear or unreadable fragments as `[[unclear: ...]]`.
 - Do not guess missing words or page numbers.
 - Do not paraphrase, translate, normalize, or collapse stylized TOC text into prose.
+- Do not flatten parent and child lines into one uniform style.
 - Use `has_unclear_regions = true` when any important fragment is unclear.
 "#;
 
@@ -93,12 +100,17 @@ You extract a PDF table of contents from a combined markdown document produced f
 
 Rules:
 - Decide whether the document contains a real TOC.
+- Hierarchy fidelity is the top priority. Recover every visible TOC layer that is supported by the markdown and review notes.
 - Use the markdown page boundaries, layout notes, and region content as the primary evidence.
 - Only extract entries that are explicitly supported by the markdown or the provided visual review notes.
 - Preserve title text exactly as printed, including numbering and punctuation that belong to the title.
+- Use the smallest dense level numbers that still preserve every distinct visible hierarchy layer across the TOC.
+- If the source shows multiple indentation, numbering, alignment, or grouping styles, map them to multiple `level` values. Never flatten distinct parent and child styles into the same level.
+- If a visible parent heading and its children both appear in the TOC, output both as separate entries.
+- Use indentation, numbering depth, alignment, leader style, grouping labels, boxed headings, and reading-order notes when restoring levels.
 - Use level = 1 for top-level entries.
 - Use the field `page` for the printed TOC page label exactly as shown.
-- When the markdown is insufficient for a reliable decision, return a `review_requests` item instead of guessing.
+- When the markdown is insufficient to restore levels reliably, return a `review_requests` item instead of guessing or collapsing levels.
 - Each review request must include `physical_page`, `reason`, and `line_hint`.
 - After review notes are provided, consume them and return `review_requests = []` unless the TOC is still unreliable.
 "#;
@@ -135,6 +147,17 @@ pub struct StructuredOutputTrace {
     pub raw_output: String,
     pub repaired_output: Option<String>,
     pub structured_output: String,
+    pub duration_ms: u64,
+    pub repair_trace: Option<RepairTrace>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepairTrace {
+    pub preamble: String,
+    pub prompt: Message,
+    pub raw_output: String,
+    pub structured_output: String,
+    pub usage: Usage,
     pub duration_ms: u64,
 }
 
@@ -219,6 +242,7 @@ pub async fn identify_toc_pages(
     pages: &[RenderedPage],
     progress_span: Option<&Span>,
     progress_label: &str,
+    trace_recorder: Option<&DebugTraceRecorder>,
 ) -> Result<LlmCall<TocPageAssessmentBatch>> {
     if pages.is_empty() {
         bail!("no sampled pages were provided to the TOC locator");
@@ -239,6 +263,8 @@ pub async fn identify_toc_pages(
         TOC_DISCOVERY_PREAMBLE,
         progress_span,
         progress_label,
+        trace_recorder,
+        "identify_toc_pages",
     )
     .await
 }
@@ -248,6 +274,7 @@ pub async fn infer_toc_from_page_text(
     pages: &[ExtractedPageText],
     progress_span: Option<&Span>,
     progress_label: &str,
+    trace_recorder: Option<&DebugTraceRecorder>,
 ) -> Result<LlmCall<TocTextInferenceBatch>> {
     if pages.is_empty() {
         bail!("no extracted page text was provided to the TOC text locator");
@@ -263,6 +290,10 @@ pub async fn infer_toc_from_page_text(
         prompt,
         progress_span,
         progress_label,
+        trace_recorder,
+        "infer_toc_from_page_text",
+        None,
+        page_range_from_extracted_pages(pages),
     )
     .await
 }
@@ -273,6 +304,7 @@ pub async fn observe_page_labels(
     pages: &[RenderedPage],
     progress_span: Option<&Span>,
     progress_label: &str,
+    trace_recorder: Option<&DebugTraceRecorder>,
 ) -> Result<LlmCall<Vec<VisionPageObservation>>> {
     if pages.is_empty() {
         return Ok(LlmCall {
@@ -298,6 +330,8 @@ pub async fn observe_page_labels(
         "You inspect PDF page images. Return one observation per input page image, in the same order as the input. For each page image, detect the visible printed page label if one is clearly present in the page header or footer. Use the exact visible label, usually digits or roman numerals. If no printed page label is visible, use null. Prefer the schema field `observations`, and each observation should use the field `page` for that visible label, not the PDF physical page number.",
         progress_span,
         progress_label,
+        trace_recorder,
+        "observe_page_labels",
     )
     .await?;
     let observations = bind_page_label_observations(pages, &response.data.observations);
@@ -380,47 +414,12 @@ pub async fn transcribe_toc_pages_to_markdown(
                     prompt,
                     Some(&worker_span),
                     &worker_batch_label(worker_index, worker_count, &page_range_label),
+                    trace_recorder.as_ref(),
+                    "transcribe_toc_pages_to_markdown",
+                    Some(format!("worker {}/{}", worker_index + 1, worker_count)),
+                    Some(page_range_label.clone()),
                 )
                 .await?;
-
-                if let Some(recorder) = trace_recorder.as_ref() {
-                    let mut artifact_refs = Vec::new();
-                    if let Some(input_ref) = recorder.record_text_artifact(
-                        "toc_markdown_worker_input",
-                        &build_toc_markdown_worker_input_summary(&batch.pages),
-                    )? {
-                        artifact_refs.push(input_ref);
-                    }
-                    if let Some(trace) = response.trace.as_ref() {
-                        if let Some(raw_ref) = recorder
-                            .record_text_artifact("toc_markdown_worker_raw_output", &trace.raw_output)?
-                        {
-                            artifact_refs.push(raw_ref);
-                        }
-                        if let Some(repaired_output) = trace.repaired_output.as_ref()
-                            && let Some(repaired_ref) = recorder.record_text_artifact(
-                                "toc_markdown_worker_repaired_output",
-                                repaired_output,
-                            )?
-                        {
-                            artifact_refs.push(repaired_ref);
-                        }
-                        if let Some(structured_ref) = recorder.record_text_artifact(
-                            "toc_markdown_worker_structured_output",
-                            &trace.structured_output,
-                        )? {
-                            artifact_refs.push(structured_ref);
-                        }
-                    }
-                    recorder.record_stage(DebugTraceStageRecord {
-                        stage_name: "transcribe_toc_pages_to_markdown".to_string(),
-                        page_range: Some(page_range_label.clone()),
-                        worker: Some(format!("worker {}/{}", worker_index + 1, worker_count)),
-                        artifact_refs,
-                        usage: DebugTraceUsageSnapshot::from_usage(&response.usage),
-                        duration_ms: response.trace.as_ref().map(|trace| trace.duration_ms),
-                    })?;
-                }
 
                 let finished_batches = completed_batches.fetch_add(1, Ordering::Relaxed) + 1;
                 let finished_pages =
@@ -496,6 +495,8 @@ pub async fn extract_toc_from_markdown(
     review_results: &[VisualReviewResult],
     progress_span: Option<&Span>,
     progress_label: &str,
+    trace_recorder: Option<&DebugTraceRecorder>,
+    stage_name: &str,
 ) -> Result<LlmCall<TocExtraction>> {
     let prompt = build_toc_markdown_extraction_message(document, review_results)?;
     stream_structured_output(
@@ -504,6 +505,10 @@ pub async fn extract_toc_from_markdown(
         prompt,
         progress_span,
         progress_label,
+        trace_recorder,
+        stage_name,
+        None,
+        page_range_from_toc_markdown_document(document),
     )
     .await
 }
@@ -515,6 +520,7 @@ pub async fn review_toc_visual_gaps(
     document: &TocMarkdownDocument,
     progress_span: Option<&Span>,
     progress_label: &str,
+    trace_recorder: Option<&DebugTraceRecorder>,
 ) -> Result<LlmCall<Vec<VisualReviewResult>>> {
     if requests.is_empty() {
         return Ok(LlmCall {
@@ -532,6 +538,10 @@ pub async fn review_toc_visual_gaps(
         prompt,
         progress_span,
         progress_label,
+        trace_recorder,
+        "review_toc_visual_gaps",
+        None,
+        page_range_from_rendered_pages(pages),
     )
     .await?;
 
@@ -801,12 +811,20 @@ fn build_openai_client(config: &LlmConfig) -> Result<openai::CompletionsClient> 
         .context("failed to initialize OpenAI client")
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Structured LLM calls need explicit trace metadata and progress handles"
+)]
 async fn stream_structured_output<T>(
     config: &LlmConfig,
     preamble: &str,
     prompt: Message,
     progress_span: Option<&Span>,
     progress_label: &str,
+    trace_recorder: Option<&DebugTraceRecorder>,
+    stage_name: &str,
+    worker: Option<String>,
+    page_range: Option<String>,
 ) -> Result<LlmCall<T>>
 where
     T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
@@ -819,7 +837,7 @@ where
         .preamble(preamble)
         .output_schema::<T>()
         .build();
-    let mut stream = agent.stream_prompt(prompt).await;
+    let mut stream = agent.stream_prompt(prompt.clone()).await;
     let mut output_chars = 0usize;
     let mut streamed_text = String::new();
     let mut final_text = String::new();
@@ -866,18 +884,24 @@ where
         &output_window.render(),
     );
 
-    let (data, repaired_output, repair_usage) = match serde_json::from_str::<T>(&final_text) {
-        Ok(data) => (data, None, Usage::new()),
+    let (data, repaired_output, repair_usage, repair_trace) = match serde_json::from_str::<T>(&final_text) {
+        Ok(data) => (data, None, Usage::new(), None),
         Err(initial_error) => {
-            let (repaired_json, repair_usage) =
+            let (repaired_json, repair_usage, repair_trace) =
                 repair_structured_output::<T>(&client, model, &final_text).await?;
-            let data = serde_json::from_str(&repaired_json).with_context(|| {
+            let repaired_value = serde_json::from_str::<serde_json::Value>(&repaired_json).with_context(|| {
+                format!(
+                    "failed to parse repaired structured response as JSON value. original: {final_text}; repaired: {}; initial error: {initial_error}",
+                    repaired_json
+                )
+            })?;
+            let data = serde_json::from_value(repaired_value).with_context(|| {
                 format!(
                     "failed to deserialize structured response after repair. original: {final_text}; repaired: {}; initial error: {initial_error}",
                     repaired_json
                 )
             })?;
-            (data, Some(repaired_json), repair_usage)
+            (data, Some(repaired_json), repair_usage, Some(repair_trace))
         }
     };
     usage += repair_usage;
@@ -885,16 +909,32 @@ where
     let structured_output = serde_json::to_string_pretty(&response.data)
         .context("failed to serialize structured output trace")?;
 
+    let trace = StructuredOutputTrace {
+        raw_output: final_text,
+        repaired_output,
+        structured_output,
+        duration_ms: started_at.elapsed().as_millis() as u64,
+        repair_trace,
+    };
+
+    if let Some(recorder) = trace_recorder {
+        record_llm_call_trace(
+            recorder,
+            stage_name,
+            worker.clone(),
+            page_range.clone(),
+            preamble,
+            &prompt,
+            &trace,
+            &response.usage,
+        )?;
+    }
+
     Ok(LlmCall {
         data: response.data,
         usage: response.usage,
         calls: 1,
-        trace: Some(StructuredOutputTrace {
-            raw_output: final_text,
-            repaired_output,
-            structured_output,
-            duration_ms: started_at.elapsed().as_millis() as u64,
-        }),
+        trace: Some(trace),
     })
 }
 
@@ -911,6 +951,8 @@ async fn stream_batched_structured_output<T, FBuild, FMerge>(
     preamble: &str,
     progress_span: Option<&Span>,
     progress_label: &str,
+    trace_recorder: Option<&DebugTraceRecorder>,
+    stage_name: &str,
 ) -> Result<LlmCall<T>>
 where
     T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
@@ -961,6 +1003,8 @@ where
         let completed_pages = Arc::clone(&completed_pages);
         let parent_span = progress_span.cloned();
         let progress_label = progress_label.to_string();
+        let trace_recorder = trace_recorder.cloned();
+        let stage_name = stage_name.to_string();
 
         handles.push(tokio::spawn(async move {
             let result = run_batched_worker::<T, FBuild>(
@@ -977,6 +1021,8 @@ where
                 worker_span.clone(),
                 completed_batches,
                 completed_pages,
+                trace_recorder,
+                stage_name,
             )
             .await;
 
@@ -1038,6 +1084,8 @@ async fn run_batched_worker<T, FBuild>(
     worker_span: Span,
     completed_batches: Arc<AtomicUsize>,
     completed_pages: Arc<AtomicUsize>,
+    trace_recorder: Option<DebugTraceRecorder>,
+    stage_name: String,
 ) -> Result<Vec<BatchResult<T>>>
 where
     T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
@@ -1058,6 +1106,10 @@ where
             prompt,
             Some(&worker_span),
             &worker_batch_label(worker_index, worker_count, &page_range_label),
+            trace_recorder.as_ref(),
+            &stage_name,
+            Some(format!("worker {}/{}", worker_index + 1, worker_count)),
+            Some(page_range_label.clone()),
         )
         .await?;
 
@@ -1185,19 +1237,6 @@ fn evidence_page_range_label(pages: &[TocPageEvidence]) -> String {
     } else {
         format!("page {first}..{last}")
     }
-}
-
-fn build_toc_markdown_worker_input_summary(pages: &[TocPageEvidence]) -> String {
-    let mut sections = Vec::with_capacity(pages.len());
-    for page in pages {
-        sections.push(format!(
-            "PDF physical page {}\n[pdf_text]\n{}\n[ocr_text]\n{}",
-            page.physical_page,
-            page.pdf_text.as_deref().unwrap_or("[[none]]"),
-            page.ocr_text.as_deref().unwrap_or("[[none]]")
-        ));
-    }
-    sections.join("\n\n")
 }
 
 struct OutputWindow {
@@ -1336,10 +1375,11 @@ async fn repair_structured_output<T>(
     client: &openai::CompletionsClient,
     model: &str,
     invalid_output: &str,
-) -> Result<(String, Usage)>
+) -> Result<(String, Usage, RepairTrace)>
 where
     T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
 {
+    let started_at = Instant::now();
     let schema = serde_json::to_string_pretty(&schema_for!(T))
         .context("failed to serialize structured output schema for repair")?;
     let repair_prompt = Message::User {
@@ -1354,15 +1394,302 @@ where
             "You repair malformed structured outputs. Return only valid JSON that conforms exactly to the provided schema.",
         )
         .build()
-        .prompt_typed::<serde_json::Value>(repair_prompt)
+        .prompt(repair_prompt.clone())
         .extended_details()
         .await
         .context("failed to repair malformed structured output")?;
+    let structured_output = repaired.output.clone();
     Ok((
-        serde_json::to_string(&repaired.output)
-            .context("failed to serialize repaired structured output")?,
+        structured_output.clone(),
         repaired.usage,
+        RepairTrace {
+            preamble: "You repair malformed structured outputs. Return only valid JSON that conforms exactly to the provided schema.".to_string(),
+            prompt: repair_prompt,
+            raw_output: structured_output.clone(),
+            structured_output,
+            usage: repaired.usage,
+            duration_ms: started_at.elapsed().as_millis() as u64,
+        },
     ))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Trace records must carry prompt, output, usage, and worker metadata together"
+)]
+fn record_llm_call_trace(
+    recorder: &DebugTraceRecorder,
+    stage_name: &str,
+    worker: Option<String>,
+    page_range: Option<String>,
+    preamble: &str,
+    prompt: &Message,
+    trace: &StructuredOutputTrace,
+    usage: &Usage,
+) -> Result<()> {
+    let raw_output_ref = recorder.record_text_artifact("llm_raw_output", &trace.raw_output)?;
+    let repaired_output_ref = trace
+        .repaired_output
+        .as_ref()
+        .map(|text| recorder.record_text_artifact("llm_repaired_output", text))
+        .transpose()?
+        .flatten();
+    let structured_output_ref =
+        recorder.record_text_artifact("llm_structured_output", &trace.structured_output)?;
+
+    let mut messages = vec![DebugTraceMessageRecord {
+        role: "system".to_string(),
+        parts: vec![DebugTraceMessagePartRecord {
+            kind: "text".to_string(),
+            artifact_ref: recorder.record_text_artifact("llm_system_message", preamble)?,
+            text: None,
+            media_type: None,
+            detail: None,
+        }],
+    }];
+    messages.push(convert_message_for_trace(recorder, prompt)?);
+    messages.push(DebugTraceMessageRecord {
+        role: "assistant".to_string(),
+        parts: vec![DebugTraceMessagePartRecord {
+            kind: "text".to_string(),
+            artifact_ref: raw_output_ref.clone(),
+            text: None,
+            media_type: None,
+            detail: None,
+        }],
+    });
+
+    let output = DebugTraceLlmOutputRecord {
+        raw_output_ref,
+        repaired_output_ref,
+        structured_output_ref,
+    };
+
+    recorder.record_llm_call(DebugTraceLlmCallRecord {
+        call_id: String::new(),
+        stage_name: stage_name.to_string(),
+        worker: worker.clone(),
+        page_range: page_range.clone(),
+        messages,
+        output,
+        usage: DebugTraceUsageSnapshot::from_usage(usage),
+        duration_ms: Some(trace.duration_ms),
+    })?;
+
+    if let Some(repair_trace) = trace.repair_trace.as_ref() {
+        let repair_raw_output_ref =
+            recorder.record_text_artifact("llm_repair_raw_output", &repair_trace.raw_output)?;
+        let repair_structured_output_ref = recorder.record_text_artifact(
+            "llm_repair_structured_output",
+            &repair_trace.structured_output,
+        )?;
+        let repair_output = DebugTraceLlmOutputRecord {
+            raw_output_ref: repair_raw_output_ref.clone(),
+            repaired_output_ref: None,
+            structured_output_ref: repair_structured_output_ref,
+        };
+        recorder.record_llm_call(DebugTraceLlmCallRecord {
+            call_id: String::new(),
+            stage_name: format!("{stage_name}.repair"),
+            worker: worker.clone(),
+            page_range: page_range.clone(),
+            messages: vec![
+                DebugTraceMessageRecord {
+                role: "system".to_string(),
+                parts: vec![DebugTraceMessagePartRecord {
+                    kind: "text".to_string(),
+                    artifact_ref: recorder.record_text_artifact(
+                        "llm_repair_system_message",
+                        &repair_trace.preamble,
+                    )?,
+                    text: None,
+                    media_type: None,
+                    detail: None,
+                }],
+            },
+                convert_message_for_trace(recorder, &repair_trace.prompt)?,
+                DebugTraceMessageRecord {
+                    role: "assistant".to_string(),
+                    parts: vec![DebugTraceMessagePartRecord {
+                        kind: "text".to_string(),
+                        artifact_ref: repair_raw_output_ref,
+                        text: None,
+                        media_type: None,
+                        detail: None,
+                    }],
+                },
+            ],
+            output: repair_output,
+            usage: DebugTraceUsageSnapshot::from_usage(&repair_trace.usage),
+            duration_ms: Some(repair_trace.duration_ms),
+        })?;
+    }
+
+    Ok(())
+}
+
+fn convert_message_for_trace(
+    recorder: &DebugTraceRecorder,
+    message: &Message,
+) -> Result<DebugTraceMessageRecord> {
+    match message {
+        Message::System { content } => Ok(DebugTraceMessageRecord {
+            role: "system".to_string(),
+            parts: vec![DebugTraceMessagePartRecord {
+                kind: "text".to_string(),
+                artifact_ref: recorder.record_text_artifact("llm_message_text", content)?,
+                text: None,
+                media_type: None,
+                detail: None,
+            }],
+        }),
+        Message::User { content } => Ok(DebugTraceMessageRecord {
+            role: "user".to_string(),
+            parts: content
+                .iter()
+                .map(|part| convert_user_content_for_trace(recorder, part))
+                .collect::<Result<Vec<_>>>()?,
+        }),
+        Message::Assistant { content, .. } => Ok(DebugTraceMessageRecord {
+            role: "assistant".to_string(),
+            parts: content
+                .iter()
+                .map(|part| convert_assistant_content_for_trace(recorder, part))
+                .collect::<Result<Vec<_>>>()?,
+        }),
+    }
+}
+
+fn convert_user_content_for_trace(
+    recorder: &DebugTraceRecorder,
+    content: &UserContent,
+) -> Result<DebugTraceMessagePartRecord> {
+    match content {
+        UserContent::Text(text) => Ok(DebugTraceMessagePartRecord {
+            kind: "text".to_string(),
+            artifact_ref: recorder.record_text_artifact("llm_message_text", &text.text)?,
+            text: None,
+            media_type: None,
+            detail: None,
+        }),
+        UserContent::Image(image) => convert_image_for_trace(recorder, image),
+        UserContent::Audio(_) => Ok(DebugTraceMessagePartRecord {
+            kind: "audio".to_string(),
+            artifact_ref: None,
+            text: None,
+            media_type: None,
+            detail: None,
+        }),
+        UserContent::Video(_) => Ok(DebugTraceMessagePartRecord {
+            kind: "video".to_string(),
+            artifact_ref: None,
+            text: None,
+            media_type: None,
+            detail: None,
+        }),
+        UserContent::Document(_) => Ok(DebugTraceMessagePartRecord {
+            kind: "document".to_string(),
+            artifact_ref: None,
+            text: None,
+            media_type: None,
+            detail: None,
+        }),
+        UserContent::ToolResult(tool_result) => Ok(DebugTraceMessagePartRecord {
+            kind: "tool_result".to_string(),
+            artifact_ref: recorder.record_json_artifact("llm_tool_result", tool_result)?,
+            text: None,
+            media_type: None,
+            detail: None,
+        }),
+    }
+}
+
+fn convert_assistant_content_for_trace(
+    recorder: &DebugTraceRecorder,
+    content: &AssistantContent,
+) -> Result<DebugTraceMessagePartRecord> {
+    match content {
+        AssistantContent::Text(text) => Ok(DebugTraceMessagePartRecord {
+            kind: "text".to_string(),
+            artifact_ref: recorder.record_text_artifact("llm_message_text", &text.text)?,
+            text: None,
+            media_type: None,
+            detail: None,
+        }),
+        AssistantContent::Image(image) => convert_image_for_trace(recorder, image),
+        AssistantContent::ToolCall(tool_call) => Ok(DebugTraceMessagePartRecord {
+            kind: "tool_call".to_string(),
+            artifact_ref: recorder.record_json_artifact("llm_tool_call", tool_call)?,
+            text: None,
+            media_type: None,
+            detail: None,
+        }),
+        AssistantContent::Reasoning(reasoning) => Ok(DebugTraceMessagePartRecord {
+            kind: "reasoning".to_string(),
+            artifact_ref: recorder.record_json_artifact("llm_reasoning", reasoning)?,
+            text: None,
+            media_type: None,
+            detail: None,
+        }),
+    }
+}
+
+fn convert_image_for_trace(
+    recorder: &DebugTraceRecorder,
+    image: &Image,
+) -> Result<DebugTraceMessagePartRecord> {
+    let artifact_ref = match &image.data {
+        DocumentSourceKind::Base64(data) => {
+            let bytes = BASE64_STANDARD
+                .decode(data)
+                .context("failed to decode base64 image for trace")?;
+            recorder.record_binary_artifact("llm_message_image", "png", &bytes)?
+        }
+        DocumentSourceKind::Raw(bytes) => {
+            recorder.record_binary_artifact("llm_message_image", "bin", bytes)?
+        }
+        DocumentSourceKind::Url(url) | DocumentSourceKind::String(url) => {
+            recorder.record_text_artifact("llm_message_image_ref", url)?
+        }
+        DocumentSourceKind::Unknown => None,
+        _ => None,
+    };
+
+    Ok(DebugTraceMessagePartRecord {
+        kind: "image".to_string(),
+        artifact_ref,
+        text: None,
+        media_type: image.media_type.as_ref().map(|ty| format!("{ty:?}").to_ascii_lowercase()),
+        detail: image.detail.as_ref().map(|detail| format!("{detail:?}").to_ascii_lowercase()),
+    })
+}
+
+fn page_range_from_rendered_pages(pages: &[RenderedPage]) -> Option<String> {
+    page_range_from_numbers(&pages.iter().map(|page| page.physical_page).collect::<Vec<_>>())
+}
+
+fn page_range_from_extracted_pages(pages: &[ExtractedPageText]) -> Option<String> {
+    page_range_from_numbers(&pages.iter().map(|page| page.physical_page).collect::<Vec<_>>())
+}
+
+fn page_range_from_toc_markdown_document(document: &TocMarkdownDocument) -> Option<String> {
+    page_range_from_numbers(
+        &document
+            .pages
+            .iter()
+            .map(|page| page.physical_page)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn page_range_from_numbers(pages: &[usize]) -> Option<String> {
+    let first = *pages.iter().min()?;
+    let last = *pages.iter().max()?;
+    Some(if first == last {
+        first.to_string()
+    } else {
+        format!("{first}..{last}")
+    })
 }
 
 #[cfg(test)]
@@ -1373,17 +1700,19 @@ mod tests {
     use rig::client::CompletionClient;
     use rig::completion::Prompt;
     use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
+    use serde::Deserialize;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Instant;
 
     use super::{
-        LlmConfig, ObservedPrintedPageLabel, OutputWindow, RenderedPage, TocDirectionHint,
-        VisionRequestConfig, batch_page_range_label, bind_page_label_observations,
-        build_openai_client, display_width, identify_toc_pages, take_prefix_width,
-        take_suffix_width,
+        LlmConfig, ObservedPrintedPageLabel, OutputWindow, RenderedPage,
+        TocDirectionHint, TocMarkdownTranscriptionBatch, VisionRequestConfig,
+        batch_page_range_label, bind_page_label_observations, build_openai_client,
+        display_width, identify_toc_pages, take_prefix_width, take_suffix_width,
     };
     use crate::config::{CliArgs, resolve_args};
+    use crate::model::TocPageMarkdown;
     use crate::pdf_support::PdfWorkspace;
     use crate::qpdf_outline::open_pdf;
 
@@ -1396,6 +1725,11 @@ mod tests {
         pdf_path: PathBuf,
         pages: Vec<usize>,
         expected_directions: Vec<TocDirectionHint>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct DuplicateFieldRepairFixture {
+        pages: Vec<TocPageMarkdown>,
     }
 
     fn load_live_test_config() -> Result<LlmConfig> {
@@ -1438,6 +1772,17 @@ mod tests {
 
         ensure!(response.trim() == "x", "unexpected response: {response:?}");
         Ok(())
+    }
+
+    #[test]
+    fn repaired_json_value_allows_duplicate_fields_in_objects() {
+        let repaired = r#"{"pages":[{"physical_page":18,"markdown":"x","layout_notes":"y","has_unclear_regions":false,"physical_page":18}]}"#;
+        let repaired_value: serde_json::Value =
+            serde_json::from_str(repaired).expect("parse repaired json as value");
+        let parsed: DuplicateFieldRepairFixture =
+            serde_json::from_value(repaired_value).expect("deserialize repaired value");
+        assert_eq!(parsed.pages.len(), 1);
+        assert_eq!(parsed.pages[0].physical_page, 18);
     }
 
     #[tokio::test]
@@ -1522,6 +1867,7 @@ mod tests {
             &rendered_pages,
             None,
             "live TOC direction test",
+            None,
         )
         .await?;
         let actual_by_page = response

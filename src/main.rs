@@ -22,10 +22,9 @@ use crate::{
     config::{AppArgs, CliArgs, resolve_args},
     debug_trace::DebugTraceRecorder,
     llm::{
-        LlmCall, LlmConfig, StructuredOutputTrace, TocPageAssessmentBatch, VisionRequestConfig,
-        VisionPageObservation, extract_toc_from_markdown, identify_toc_pages,
-        infer_toc_from_page_text, observe_page_labels, review_toc_visual_gaps,
-        transcribe_toc_pages_to_markdown,
+        LlmCall, LlmConfig, TocPageAssessmentBatch, VisionRequestConfig, VisionPageObservation,
+        extract_toc_from_markdown, identify_toc_pages, infer_toc_from_page_text,
+        observe_page_labels, review_toc_visual_gaps, transcribe_toc_pages_to_markdown,
     },
     model::{
         DebugTraceStageRecord, DebugTraceUsageSnapshot, ExtractedPageText, OutlineEntry,
@@ -423,7 +422,6 @@ async fn run(args: AppArgs, trace_recorder: &DebugTraceRecorder) -> Result<RunOu
         "transcribe_toc_pages_to_markdown",
         &toc_markdown_pages,
         &usage,
-        None,
     )?;
 
     set_run_status(
@@ -474,27 +472,20 @@ async fn run(args: AppArgs, trace_recorder: &DebugTraceRecorder) -> Result<RunOu
         data: initial_extracted,
         usage,
         calls,
-        trace,
+        ..
     } = extract_toc_from_markdown(
         &llm_config,
         &toc_markdown_document,
         &[],
         Some(&extract_span),
         &extract_message,
+        trace_recorder.is_enabled().then_some(trace_recorder),
+        "extract_toc_from_markdown",
     )
     .instrument(extract_span.clone())
     .await?;
     agent_progress.record(usage, calls);
     drop(extract_span);
-    record_llm_stage(
-        trace_recorder,
-        "extract_toc_from_markdown",
-        Some(format_rendered_page_range(&rendered_toc_pages)),
-        None,
-        &toc_markdown_document.combined_markdown,
-        &usage,
-        trace.as_ref(),
-    )?;
 
     let extracted = if initial_extracted.review_requests.is_empty() {
         finish_stage(
@@ -538,7 +529,7 @@ async fn run(args: AppArgs, trace_recorder: &DebugTraceRecorder) -> Result<RunOu
             data: review_results,
             usage,
             calls,
-            trace,
+            ..
         } = review_toc_visual_gaps(
             &llm_config,
             &initial_extracted.review_requests,
@@ -546,6 +537,7 @@ async fn run(args: AppArgs, trace_recorder: &DebugTraceRecorder) -> Result<RunOu
             &toc_markdown_document,
             Some(&review_span),
             &review_message,
+            trace_recorder.is_enabled().then_some(trace_recorder),
         )
         .instrument(review_span.clone())
         .await?;
@@ -563,7 +555,6 @@ async fn run(args: AppArgs, trace_recorder: &DebugTraceRecorder) -> Result<RunOu
             &initial_extracted.review_requests,
             &review_results,
             &usage,
-            trace.as_ref(),
         )?;
 
         let reextract_span = start_spinner(
@@ -575,27 +566,20 @@ async fn run(args: AppArgs, trace_recorder: &DebugTraceRecorder) -> Result<RunOu
             data: reviewed_extracted,
             usage,
             calls,
-            trace,
+            ..
         } = extract_toc_from_markdown(
             &llm_config,
             &toc_markdown_document,
             &review_results,
             Some(&reextract_span),
             &reextract_message,
+            trace_recorder.is_enabled().then_some(trace_recorder),
+            "reextract_toc_from_markdown",
         )
         .instrument(reextract_span.clone())
         .await?;
         agent_progress.record(usage, calls);
         drop(reextract_span);
-        record_llm_stage(
-            trace_recorder,
-            "reextract_toc_from_markdown",
-            Some(format_rendered_page_range(&rendered_toc_pages)),
-            None,
-            &toc_markdown_document.combined_markdown,
-            &usage,
-            trace.as_ref(),
-        )?;
         reviewed_extracted
     };
 
@@ -712,13 +696,14 @@ async fn run(args: AppArgs, trace_recorder: &DebugTraceRecorder) -> Result<RunOu
         data: observations,
         usage,
         calls,
-        trace,
+        ..
     } = observe_page_labels(
         &llm_config,
         vision_request_config,
         &rendered_label_pages,
         Some(&observe_span),
         &observe_message,
+        trace_recorder.is_enabled().then_some(trace_recorder),
     )
     .instrument(observe_span.clone())
     .await?;
@@ -737,7 +722,7 @@ async fn run(args: AppArgs, trace_recorder: &DebugTraceRecorder) -> Result<RunOu
         &agent_progress.usage,
         agent_progress.calls,
     );
-    record_page_label_stage(trace_recorder, &observations, &usage, trace.as_ref())?;
+    record_page_label_stage(trace_recorder, &observations, &usage)?;
 
     set_run_status(
         &run_span,
@@ -1113,13 +1098,14 @@ async fn discover_toc_range(
             data: toc_page_batch,
             usage,
             calls,
-            trace,
+            ..
         } = identify_toc_pages(
             llm_config,
             vision_request_config,
             &discovery_rendered,
             Some(&discovery_span),
             &discovery_message,
+            trace_recorder.is_enabled().then_some(trace_recorder),
         )
         .instrument(discovery_span.clone())
         .await?;
@@ -1139,16 +1125,6 @@ async fn discover_toc_range(
             "TOC pages detected"
         );
         drop(discovery_span);
-        record_llm_stage(
-            trace_recorder,
-            "identify_toc_pages",
-            Some(format!("{}..{}", candidate_range.start, candidate_range.end)),
-            None,
-            "",
-            &usage,
-            trace.as_ref(),
-        )?;
-
         if hit_count > 0 {
             let refined = workspace.refine_toc_range(args.toc, &toc_page_batch);
             tracing::info!(
@@ -1245,26 +1221,18 @@ async fn try_discover_toc_range_from_text(
         data,
         usage,
         calls,
-        trace,
+        ..
     } = infer_toc_from_page_text(
         llm_config,
         &extracted_pages,
         Some(&infer_span),
         &infer_message,
+        trace_recorder.is_enabled().then_some(trace_recorder),
     )
     .instrument(infer_span.clone())
     .await?;
     agent_progress.record(usage, calls);
     drop(infer_span);
-    record_llm_stage(
-        trace_recorder,
-        "infer_toc_from_page_text",
-        Some(format!("{}..{}", candidate_range.start, candidate_range.end)),
-        None,
-        &summarize_extracted_pages(&extracted_pages),
-        &usage,
-        trace.as_ref(),
-    )?;
 
     let batch = TocPageAssessmentBatch {
         toc_found: data.toc_found,
@@ -1489,7 +1457,6 @@ fn record_toc_markdown_stage(
     stage_name: &str,
     pages: &[TocPageMarkdown],
     usage: &Usage,
-    trace: Option<&StructuredOutputTrace>,
 ) -> Result<()> {
     if !trace_recorder.is_enabled() {
         return Ok(());
@@ -1499,7 +1466,6 @@ fn record_toc_markdown_stage(
     if let Some(artifact_ref) = trace_recorder.record_json_artifact(stage_name, &pages)? {
         artifact_refs.push(artifact_ref);
     }
-    extend_trace_artifacts(trace_recorder, &mut artifact_refs, trace)?;
     trace_recorder.record_stage(DebugTraceStageRecord {
         stage_name: stage_name.to_string(),
         page_range: page_range_from_numbers(
@@ -1508,7 +1474,7 @@ fn record_toc_markdown_stage(
         worker: None,
         artifact_refs,
         usage: DebugTraceUsageSnapshot::from_usage(usage),
-        duration_ms: trace.map(|trace| trace.duration_ms),
+        duration_ms: None,
     })
 }
 
@@ -1548,7 +1514,6 @@ fn record_page_label_stage(
     trace_recorder: &DebugTraceRecorder,
     observations: &[VisionPageObservation],
     usage: &Usage,
-    trace: Option<&StructuredOutputTrace>,
 ) -> Result<()> {
     if !trace_recorder.is_enabled() {
         return Ok(());
@@ -1560,7 +1525,6 @@ fn record_page_label_stage(
     {
         artifact_refs.push(artifact_ref);
     }
-    extend_trace_artifacts(trace_recorder, &mut artifact_refs, trace)?;
     trace_recorder.record_stage(DebugTraceStageRecord {
         stage_name: "observe_page_labels".to_string(),
         page_range: page_range_from_numbers(
@@ -1572,7 +1536,7 @@ fn record_page_label_stage(
         worker: None,
         artifact_refs,
         usage: DebugTraceUsageSnapshot::from_usage(usage),
-        duration_ms: trace.map(|trace| trace.duration_ms),
+        duration_ms: None,
     })
 }
 
@@ -1581,7 +1545,6 @@ fn record_visual_review_stage(
     requests: &[VisualReviewRequest],
     results: &[crate::model::VisualReviewResult],
     usage: &Usage,
-    trace: Option<&StructuredOutputTrace>,
 ) -> Result<()> {
     if !trace_recorder.is_enabled() {
         return Ok(());
@@ -1595,7 +1558,6 @@ fn record_visual_review_stage(
     if let Some(artifact_ref) = trace_recorder.record_json_artifact("toc_review_results", &results)? {
         artifact_refs.push(artifact_ref);
     }
-    extend_trace_artifacts(trace_recorder, &mut artifact_refs, trace)?;
     trace_recorder.record_stage(DebugTraceStageRecord {
         stage_name: "review_toc_visual_gaps".to_string(),
         page_range: page_range_from_numbers(
@@ -1607,69 +1569,8 @@ fn record_visual_review_stage(
         worker: None,
         artifact_refs,
         usage: DebugTraceUsageSnapshot::from_usage(usage),
-        duration_ms: trace.map(|trace| trace.duration_ms),
+        duration_ms: None,
     })
-}
-
-fn record_llm_stage(
-    trace_recorder: &DebugTraceRecorder,
-    stage_name: &str,
-    page_range: Option<String>,
-    worker: Option<String>,
-    input_text: &str,
-    usage: &Usage,
-    trace: Option<&StructuredOutputTrace>,
-) -> Result<()> {
-    if !trace_recorder.is_enabled() {
-        return Ok(());
-    }
-
-    let mut artifact_refs = Vec::new();
-    if !input_text.trim().is_empty()
-        && let Some(artifact_ref) = trace_recorder.record_text_artifact(
-            &format!("{stage_name}_input"),
-            input_text,
-        )?
-    {
-        artifact_refs.push(artifact_ref);
-    }
-    extend_trace_artifacts(trace_recorder, &mut artifact_refs, trace)?;
-    trace_recorder.record_stage(DebugTraceStageRecord {
-        stage_name: stage_name.to_string(),
-        page_range,
-        worker,
-        artifact_refs,
-        usage: DebugTraceUsageSnapshot::from_usage(usage),
-        duration_ms: trace.map(|trace| trace.duration_ms),
-    })
-}
-
-fn extend_trace_artifacts(
-    trace_recorder: &DebugTraceRecorder,
-    artifact_refs: &mut Vec<String>,
-    trace: Option<&StructuredOutputTrace>,
-) -> Result<()> {
-    let Some(trace) = trace else {
-        return Ok(());
-    };
-
-    if let Some(artifact_ref) =
-        trace_recorder.record_text_artifact("llm_raw_output", &trace.raw_output)?
-    {
-        artifact_refs.push(artifact_ref);
-    }
-    if let Some(repaired_output) = trace.repaired_output.as_ref()
-        && let Some(artifact_ref) =
-            trace_recorder.record_text_artifact("llm_repaired_output", repaired_output)?
-    {
-        artifact_refs.push(artifact_ref);
-    }
-    if let Some(artifact_ref) =
-        trace_recorder.record_text_artifact("llm_structured_output", &trace.structured_output)?
-    {
-        artifact_refs.push(artifact_ref);
-    }
-    Ok(())
 }
 
 fn review_prefetch_pages(requests: &[VisualReviewRequest]) -> Vec<usize> {
