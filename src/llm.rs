@@ -1054,6 +1054,7 @@ mod tests {
             toc: None,
             vision_worker_batch_size: None,
             vision_workers: None,
+            external_process_concurrency: None,
         })?;
 
         Ok(LlmConfig {
@@ -1154,8 +1155,10 @@ mod tests {
             );
         }
 
-        let workspace = PdfWorkspace::new(case.pdf_path.clone(), page_count);
-        let rendered_pages = workspace.render_pages_with_progress(&case.pages, |_, _| {})?;
+        let workspace = PdfWorkspace::new(case.pdf_path.clone(), page_count, 1);
+        let rendered_pages = workspace
+            .render_pages_with_progress(&case.pages, |_, _| {})
+            .await?;
         let response = identify_toc_pages(
             &config,
             VisionRequestConfig {

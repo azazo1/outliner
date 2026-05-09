@@ -115,7 +115,11 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         agent_progress.calls,
     );
     let workspace_span = start_spinner("workspace", "preparing workspace");
-    let workspace = PdfWorkspace::new(args.input.clone(), page_count);
+    let workspace = PdfWorkspace::new(
+        args.input.clone(),
+        page_count,
+        args.external_process_concurrency,
+    );
     tracing::info!(page_count = workspace.page_count, "Workspace ready");
     drop(workspace_span);
     finish_stage(
@@ -216,7 +220,8 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
                     toc_pages.len()
                 ),
             );
-        })?;
+        })
+        .await?;
     tracing::info!(
         rendered_pages = rendered_toc_pages.len(),
         "TOC pages rendered"
@@ -334,7 +339,8 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
                     label_pages.len()
                 ),
             );
-        })?;
+        })
+        .await?;
     tracing::info!(
         rendered_pages = rendered_label_pages.len(),
         "Label samples rendered"
@@ -597,16 +603,19 @@ async fn discover_toc_range(
                 candidate_range.start, candidate_range.end
             ),
         );
-        match workspace.extract_page_text_with_progress(&discovery_pages, |completed, physical_page| {
-            extract_text_span.pb_set_position(completed as u64);
-            set_bar_message(
-                &extract_text_span,
-                format!(
-                    "extracting text from page {physical_page} ({completed}/{})",
-                    discovery_pages.len()
-                ),
-            );
-        }) {
+        match workspace
+            .extract_page_text_with_progress(&discovery_pages, |completed, physical_page| {
+                extract_text_span.pb_set_position(completed as u64);
+                set_bar_message(
+                    &extract_text_span,
+                    format!(
+                        "extracting text from page {physical_page} ({completed}/{})",
+                        discovery_pages.len()
+                    ),
+                );
+            })
+            .await
+        {
             Ok(extracted_pages) => {
                 drop(extract_text_span);
                 if let Some(refined) = try_discover_toc_range_from_text(
@@ -652,16 +661,19 @@ async fn discover_toc_range(
             discovery_pages.len() as u64,
             format!("OCRing TOC samples {}..{}", candidate_range.start, candidate_range.end),
         );
-        match workspace.ocr_page_text_with_progress(&discovery_pages, |completed, physical_page| {
-            ocr_span.pb_set_position(completed as u64);
-            set_bar_message(
-                &ocr_span,
-                format!(
-                    "OCRing page {physical_page} ({completed}/{})",
-                    discovery_pages.len()
-                ),
-            );
-        }) {
+        match workspace
+            .ocr_page_text_with_progress(&discovery_pages, |completed, physical_page| {
+                ocr_span.pb_set_position(completed as u64);
+                set_bar_message(
+                    &ocr_span,
+                    format!(
+                        "OCRing page {physical_page} ({completed}/{})",
+                        discovery_pages.len()
+                    ),
+                );
+            })
+            .await
+        {
             Ok(extracted_pages) => {
                 drop(ocr_span);
                 if let Some(refined) = try_discover_toc_range_from_text(
@@ -710,9 +722,8 @@ async fn discover_toc_range(
                 candidate_range.start, candidate_range.end
             ),
         );
-        let discovery_rendered = workspace.render_pages_with_progress(
-            &discovery_pages,
-            |completed, physical_page| {
+        let discovery_rendered = workspace
+            .render_pages_with_progress(&discovery_pages, |completed, physical_page| {
                 discovery_render_span.pb_set_position(completed as u64);
                 set_bar_message(
                     &discovery_render_span,
@@ -721,8 +732,8 @@ async fn discover_toc_range(
                         discovery_pages.len()
                     ),
                 );
-            },
-        )?;
+            })
+            .await?;
         tracing::info!(
             rendered_pages = discovery_rendered.len(),
             "TOC samples rendered"
@@ -1107,6 +1118,7 @@ mod tests {
             }),
             vision_worker_batch_size: 4,
             vision_workers: 4,
+            external_process_concurrency: 4,
         };
         assert_eq!(stage_count_for(&args), 8);
     }

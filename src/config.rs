@@ -13,6 +13,13 @@ const DEFAULT_CONFIG_PATH: &str = "~/.config/outliner/config.toml";
 pub const DEFAULT_VISION_WORKER_BATCH_SIZE: usize = 4;
 pub const DEFAULT_VISION_WORKERS: usize = 4;
 
+pub fn default_external_process_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .max(1)
+}
+
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 pub struct CliArgs {
@@ -42,6 +49,12 @@ pub struct CliArgs {
         help = "Number of concurrent vision workers"
     )]
     pub vision_workers: Option<usize>,
+    #[arg(
+        long = "external-process-concurrency",
+        value_name = "N",
+        help = "Number of concurrent external OCR and PDF helper processes"
+    )]
+    pub external_process_concurrency: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +67,7 @@ pub struct AppArgs {
     pub toc: Option<PageRangeSpec>,
     pub vision_worker_batch_size: usize,
     pub vision_workers: usize,
+    pub external_process_concurrency: usize,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -64,6 +78,7 @@ struct FileConfig {
     api_key: Option<String>,
     vision_worker_batch_size: Option<usize>,
     vision_workers: Option<usize>,
+    external_process_concurrency: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +137,7 @@ fn merge_args(cli: CliArgs, file: FileConfig) -> Result<AppArgs> {
         toc,
         vision_worker_batch_size,
         vision_workers,
+        external_process_concurrency,
     } = cli;
     let FileConfig {
         model: file_model,
@@ -129,6 +145,7 @@ fn merge_args(cli: CliArgs, file: FileConfig) -> Result<AppArgs> {
         api_key,
         vision_worker_batch_size: file_vision_worker_batch_size,
         vision_workers: file_vision_workers,
+        external_process_concurrency: file_external_process_concurrency,
     } = file;
 
     Ok(AppArgs {
@@ -147,6 +164,11 @@ fn merge_args(cli: CliArgs, file: FileConfig) -> Result<AppArgs> {
             vision_workers.or(file_vision_workers),
             DEFAULT_VISION_WORKERS,
             "vision_workers",
+        )?,
+        external_process_concurrency: normalize_positive_usize(
+            external_process_concurrency.or(file_external_process_concurrency),
+            default_external_process_concurrency(),
+            "external_process_concurrency",
         )?,
     })
 }
@@ -216,7 +238,7 @@ fn parse_positive_page(value: &str, raw: &str) -> Result<usize> {
 mod tests {
     use super::{
         AppArgs, CliArgs, DEFAULT_VISION_WORKER_BATCH_SIZE, DEFAULT_VISION_WORKERS, FileConfig,
-        expand_path, merge_args, parse_toc_range,
+        default_external_process_concurrency, expand_path, merge_args, parse_toc_range,
     };
     use crate::model::PageRangeSpec;
     use std::path::{Path, PathBuf};
@@ -231,6 +253,7 @@ mod tests {
             toc: Some("4..9".to_string()),
             vision_worker_batch_size: Some(2),
             vision_workers: Some(3),
+            external_process_concurrency: Some(6),
         };
         let file = FileConfig {
             model: Some("gpt-4o-mini".to_string()),
@@ -238,6 +261,7 @@ mod tests {
             api_key: Some("file-key".to_string()),
             vision_worker_batch_size: Some(7),
             vision_workers: Some(9),
+            external_process_concurrency: Some(11),
         };
 
         let resolved = merge_args(cli, file).expect("args should resolve");
@@ -256,6 +280,7 @@ mod tests {
                 }),
                 vision_worker_batch_size: 2,
                 vision_workers: 3,
+                external_process_concurrency: 6,
             }
         );
     }
@@ -270,6 +295,7 @@ mod tests {
             toc: None,
             vision_worker_batch_size: None,
             vision_workers: None,
+            external_process_concurrency: None,
         };
 
         let resolved = merge_args(cli, FileConfig::default()).expect("args should resolve");
@@ -285,6 +311,7 @@ mod tests {
                 toc: None,
                 vision_worker_batch_size: DEFAULT_VISION_WORKER_BATCH_SIZE,
                 vision_workers: DEFAULT_VISION_WORKERS,
+                external_process_concurrency: default_external_process_concurrency(),
             }
         );
     }
@@ -308,6 +335,7 @@ mod tests {
             api_key = "secret"
             vision_worker_batch_size = 2
             vision_workers = 5
+            external_process_concurrency = 7
             "#,
         )
         .expect("api config should parse");
@@ -316,6 +344,7 @@ mod tests {
         assert_eq!(file.api_key.as_deref(), Some("secret"));
         assert_eq!(file.vision_worker_batch_size, Some(2));
         assert_eq!(file.vision_workers, Some(5));
+        assert_eq!(file.external_process_concurrency, Some(7));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use futures_util::{StreamExt, stream};
 use tempfile::TempDir;
 
 use crate::{
@@ -28,13 +29,15 @@ const DISCOVERY_REFINE_TARGET_LEN: usize = 18;
 pub struct PdfWorkspace {
     pdf_path: PathBuf,
     pub page_count: usize,
+    external_process_concurrency: usize,
 }
 
 impl PdfWorkspace {
-    pub fn new(pdf_path: PathBuf, page_count: usize) -> Self {
+    pub fn new(pdf_path: PathBuf, page_count: usize, external_process_concurrency: usize) -> Self {
         Self {
             pdf_path,
             page_count,
+            external_process_concurrency: external_process_concurrency.max(1),
         }
     }
 
@@ -166,62 +169,74 @@ impl PdfWorkspace {
         sample_pages(target_range, LABEL_SAMPLE_BUDGET)
     }
 
-    pub fn render_pages_with_progress<F>(
+    pub async fn render_pages_with_progress<F>(
         &self,
         pages: &[usize],
-        mut on_page: F,
+        on_page: F,
     ) -> Result<Vec<RenderedPage>>
     where
         F: FnMut(usize, usize),
     {
-        let mut rendered = Vec::with_capacity(pages.len());
-        for (index, &physical_page) in pages.iter().enumerate() {
-            rendered.push(RenderedPage {
-                physical_page,
-                png_bytes: render_page_png_bytes(&self.pdf_path, physical_page)?,
-            });
-            on_page(index + 1, physical_page);
-        }
-        Ok(rendered)
+        run_page_tasks_with_progress(
+            self.pdf_path.clone(),
+            pages,
+            self.external_process_concurrency,
+            |pdf_path, physical_page| {
+                Ok(RenderedPage {
+                    physical_page,
+                    png_bytes: render_page_png_bytes(pdf_path.as_path(), physical_page)?,
+                })
+            },
+            on_page,
+        )
+        .await
     }
 
-    pub fn extract_page_text_with_progress<F>(
+    pub async fn extract_page_text_with_progress<F>(
         &self,
         pages: &[usize],
-        mut on_page: F,
+        on_page: F,
     ) -> Result<Vec<ExtractedPageText>>
     where
         F: FnMut(usize, usize),
     {
-        let mut extracted = Vec::with_capacity(pages.len());
-        for (index, &physical_page) in pages.iter().enumerate() {
-            extracted.push(ExtractedPageText {
-                physical_page,
-                text: extract_page_text(&self.pdf_path, physical_page)?,
-            });
-            on_page(index + 1, physical_page);
-        }
-        Ok(extracted)
+        run_page_tasks_with_progress(
+            self.pdf_path.clone(),
+            pages,
+            self.external_process_concurrency,
+            |pdf_path, physical_page| {
+                Ok(ExtractedPageText {
+                    physical_page,
+                    text: extract_page_text(pdf_path.as_path(), physical_page)?,
+                })
+            },
+            on_page,
+        )
+        .await
     }
 
-    pub fn ocr_page_text_with_progress<F>(
+    pub async fn ocr_page_text_with_progress<F>(
         &self,
         pages: &[usize],
-        mut on_page: F,
+        on_page: F,
     ) -> Result<Vec<ExtractedPageText>>
     where
         F: FnMut(usize, usize),
     {
-        let mut extracted = Vec::with_capacity(pages.len());
-        for (index, &physical_page) in pages.iter().enumerate() {
-            let png_bytes = render_page_png_bytes(&self.pdf_path, physical_page)?;
-            extracted.push(ExtractedPageText {
-                physical_page,
-                text: ocr_png_bytes(&png_bytes, physical_page)?,
-            });
-            on_page(index + 1, physical_page);
-        }
-        Ok(extracted)
+        run_page_tasks_with_progress(
+            self.pdf_path.clone(),
+            pages,
+            self.external_process_concurrency,
+            |pdf_path, physical_page| {
+                let png_bytes = render_page_png_bytes(pdf_path.as_path(), physical_page)?;
+                Ok(ExtractedPageText {
+                    physical_page,
+                    text: ocr_png_bytes(&png_bytes, physical_page)?,
+                })
+            },
+            on_page,
+        )
+        .await
     }
 
     pub fn calibrate_entries_from_observations(
@@ -478,6 +493,57 @@ fn clamp_page(value: isize, page_count: usize) -> usize {
     value.clamp(1, page_count as isize) as usize
 }
 
+async fn run_page_tasks_with_progress<T, W, F>(
+    pdf_path: PathBuf,
+    pages: &[usize],
+    concurrency: usize,
+    worker: W,
+    mut on_page: F,
+) -> Result<Vec<T>>
+where
+    T: Send + 'static,
+    W: Fn(PathBuf, usize) -> Result<T> + Send + Sync + Copy + 'static,
+    F: FnMut(usize, usize),
+{
+    if pages.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = concurrency.max(1).min(pages.len());
+    let mut pending = stream::iter(
+        pages
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, physical_page)| {
+                let pdf_path = pdf_path.clone();
+                async move {
+                    let output =
+                        tokio::task::spawn_blocking(move || worker(pdf_path, physical_page))
+                            .await
+                            .context("page worker panicked")??;
+                    Ok::<_, anyhow::Error>((index, physical_page, output))
+                }
+            }),
+    )
+    .buffer_unordered(worker_count);
+
+    let mut completed = 0;
+    let mut ordered_results = Vec::with_capacity(pages.len());
+    ordered_results.resize_with(pages.len(), || None);
+    while let Some(result) = pending.next().await {
+        let (index, physical_page, output) = result?;
+        ordered_results[index] = Some(output);
+        completed += 1;
+        on_page(completed, physical_page);
+    }
+
+    ordered_results
+        .into_iter()
+        .map(|output| output.context("missing page task result"))
+        .collect()
+}
+
 fn render_page_png_bytes(pdf_path: &Path, physical_page: usize) -> Result<Vec<u8>> {
     let temp_dir =
         TempDir::new().context("failed to create temporary directory for page rendering")?;
@@ -562,13 +628,18 @@ fn ocr_png_bytes(png_bytes: &[u8], physical_page: usize) -> Result<String> {
 mod tests {
     use super::{
         PageOffsets, PdfWorkspace, infer_best_offsets, infer_fallback_offset, is_toc_hit,
-        resolve_entry_page, sample_discovery_pages, sample_pages,
+        resolve_entry_page, run_page_tasks_with_progress, sample_discovery_pages, sample_pages,
     };
     use crate::{
         llm::{TocDirectionHint, TocPageAssessment, TocPageAssessmentBatch, VisionPageObservation},
         model::{PageLabel, PageRange, TocCandidateEntry},
     };
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        sync::{Arc, Mutex},
+        thread,
+        time::Duration,
+    };
 
     #[test]
     fn sample_pages_spreads_across_range() {
@@ -670,7 +741,7 @@ mod tests {
 
     #[test]
     fn narrow_toc_search_range_uses_direction_hints_without_hits() {
-        let workspace = PdfWorkspace::new(PathBuf::from("book.pdf"), 120);
+        let workspace = PdfWorkspace::new(PathBuf::from("book.pdf"), 120, 4);
         let range = PageRange::new(1, 40).expect("range");
         let batch = TocPageAssessmentBatch {
             toc_found: false,
@@ -695,7 +766,7 @@ mod tests {
 
     #[test]
     fn narrow_toc_search_range_returns_none_when_direction_conflicts() {
-        let workspace = PdfWorkspace::new(PathBuf::from("book.pdf"), 120);
+        let workspace = PdfWorkspace::new(PathBuf::from("book.pdf"), 120, 4);
         let range = PageRange::new(1, 40).expect("range");
         let batch = TocPageAssessmentBatch {
             toc_found: false,
@@ -723,5 +794,37 @@ mod tests {
         };
 
         assert!(is_toc_hit(&assessment));
+    }
+
+    #[tokio::test]
+    async fn run_page_tasks_with_progress_preserves_input_order() {
+        let completed_pages = Arc::new(Mutex::new(Vec::new()));
+        let progress_pages = Arc::clone(&completed_pages);
+
+        let results = run_page_tasks_with_progress(
+            PathBuf::from("unused.pdf"),
+            &[1, 2, 3],
+            2,
+            |_, physical_page| {
+                match physical_page {
+                    1 => thread::sleep(Duration::from_millis(60)),
+                    2 => thread::sleep(Duration::from_millis(10)),
+                    _ => {}
+                }
+                Ok(physical_page)
+            },
+            move |completed, physical_page| {
+                assert!((1..=3).contains(&completed));
+                progress_pages.lock().expect("progress mutex").push(physical_page);
+            },
+        )
+        .await
+        .expect("page tasks should succeed");
+
+        assert_eq!(results, vec![1, 2, 3]);
+        assert_eq!(
+            *completed_pages.lock().expect("progress mutex"),
+            vec![2, 3, 1]
+        );
     }
 }

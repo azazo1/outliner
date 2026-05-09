@@ -30,7 +30,7 @@
 - `OPENAI_API_KEY`
 - `OPENAI_BASE_URL`, 可选
 
-也可以使用配置文件 `~/.config/outliner/config.toml`.
+也可以使用配置文件 `~/.config/outliner/config.toml`. 仓库里提供了示例文件 `config.example.toml`.
 
 ### 2. 构建
 
@@ -48,7 +48,14 @@ api_base = "https://api.openai.com/v1"
 api_key = "sk-..."
 vision_worker_batch_size = 4
 vision_workers = 4
+external_process_concurrency = 8
 ```
+
+其中:
+
+- `vision_worker_batch_size` 和 `vision_workers` 控制视觉 LLM 图片请求的批大小和并发度
+- `external_process_concurrency` 控制 `pdftotext`, `pdftoppm`, `tesseract` 这类本地外部程序的并发度
+- 如果不写 `external_process_concurrency`, 默认使用当前机器可用的 CPU 核心数
 
 如果不写配置文件, 也可以只设置环境变量:
 
@@ -78,6 +85,12 @@ outliner ./book.pdf --output ./book.outlined.pdf
 
 ```bash
 outliner ./book.pdf --vision-worker-batch-size 2 --vision-workers 4
+```
+
+控制 OCR 和 PDF 辅助程序并发度:
+
+```bash
+outliner ./book.pdf --external-process-concurrency 8
 ```
 
 限定目录页搜索范围:
@@ -111,6 +124,7 @@ outliner [OPTIONS] <INPUT>
 - `--toc <RANGE>`: 指定目录页搜索或处理范围
 - `--vision-worker-batch-size <N>`: 每个 worker 每批读取多少张图片, 默认 `4`
 - `--vision-workers <N>`: worker 并发数量, 默认 `4`
+- `--external-process-concurrency <N>`: `pdftotext`, `pdftoppm`, `tesseract` 等本地外部程序的并发数量, 默认是当前机器可用的 CPU 核心数
 
 ## 项目原理
 
@@ -157,6 +171,8 @@ outliner [OPTIONS] <INPUT>
 - 页码标定阶段, 模型负责读取正文样本页上真实可见的印刷页码
 
 图片不会默认一次性全部送进一个请求. 程序会先按 `vision_worker_batch_size` 分批, 再按 `vision_workers` 并行执行. 每个 worker 都会显示独立的子进度条.
+
+本地外部程序也不是串行逐页执行. `pdftotext`, `pdftoppm`, `tesseract` 这些页级任务会按 `external_process_concurrency` 受控并行执行, 默认并发度等于当前机器可用的 CPU 核心数.
 
 程序并不让模型直接猜测整本书结构, 而是让模型做 4 个更窄的任务:
 

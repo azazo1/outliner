@@ -1,0 +1,9 @@
+model = "gpt-4o-mini"
+api_base = "https://api.openai.com/v1"
+api_key = "sk-..."
+
+vision_worker_batch_size = 4
+vision_workers = 4
+
+# Optional. If omitted, outliner uses the available CPU core count.
+external_process_concurrency = 8
