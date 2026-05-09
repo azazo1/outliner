@@ -22,15 +22,11 @@ pub struct TocPageEvidence {
     pub rendered_page: RenderedPage,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TocPageMarkdown {
-    #[schemars(required)]
     pub physical_page: usize,
-    #[schemars(required)]
     pub markdown: String,
-    #[schemars(required)]
     pub layout_notes: String,
-    #[schemars(required)]
     pub has_unclear_regions: bool,
 }
 
@@ -50,133 +46,88 @@ pub struct VisualReviewRequest {
     pub line_hint: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VisualReviewResult {
-    #[schemars(required)]
     pub physical_page: usize,
-    #[schemars(required)]
     pub line_hint: String,
-    #[schemars(required)]
     pub clarification: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DebugTraceManifest {
-    #[schemars(required)]
     pub input_path: String,
-    #[schemars(required)]
     pub output_path: Option<String>,
-    #[schemars(required)]
     pub stage_records: Vec<DebugTraceStageRecord>,
-    #[schemars(required)]
     pub llm_calls: Vec<DebugTraceLlmCallRecord>,
-    #[schemars(required)]
     pub artifacts: Vec<DebugTraceArtifactRecord>,
-    #[schemars(required)]
     pub final_outcome: Option<DebugTraceOutcomeRecord>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DebugTraceArtifactRecord {
-    #[schemars(required)]
     pub id: String,
-    #[schemars(required)]
     pub kind: String,
-    #[schemars(required)]
     pub relative_path: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DebugTraceStageRecord {
-    #[schemars(required)]
     pub stage_name: String,
-    #[schemars(required)]
     pub page_range: Option<String>,
-    #[schemars(required)]
     pub worker: Option<String>,
-    #[schemars(required)]
     pub artifact_refs: Vec<String>,
-    #[schemars(required)]
     pub usage: DebugTraceUsageSnapshot,
-    #[schemars(required)]
     pub duration_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DebugTraceLlmCallRecord {
-    #[schemars(required)]
     pub call_id: String,
-    #[schemars(required)]
     pub stage_name: String,
-    #[schemars(required)]
     pub worker: Option<String>,
-    #[schemars(required)]
     pub page_range: Option<String>,
-    #[schemars(required)]
     pub messages: Vec<DebugTraceMessageRecord>,
-    #[schemars(required)]
     pub output: DebugTraceLlmOutputRecord,
-    #[schemars(required)]
     pub usage: DebugTraceUsageSnapshot,
-    #[schemars(required)]
     pub duration_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DebugTraceMessageRecord {
-    #[schemars(required)]
     pub role: String,
-    #[schemars(required)]
     pub parts: Vec<DebugTraceMessagePartRecord>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DebugTraceMessagePartRecord {
-    #[schemars(required)]
     pub kind: String,
-    #[schemars(required)]
     pub artifact_ref: Option<String>,
-    #[schemars(required)]
     pub text: Option<String>,
-    #[schemars(required)]
     pub media_type: Option<String>,
-    #[schemars(required)]
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DebugTraceLlmOutputRecord {
-    #[schemars(required)]
     pub raw_output_ref: Option<String>,
-    #[schemars(required)]
     pub repaired_output_ref: Option<String>,
-    #[schemars(required)]
     pub structured_output_ref: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DebugTraceUsageSnapshot {
-    #[schemars(required)]
     pub input_tokens: u64,
-    #[schemars(required)]
     pub output_tokens: u64,
-    #[schemars(required)]
     pub total_tokens: u64,
-    #[schemars(required)]
     pub cached_input_tokens: u64,
-    #[schemars(required)]
     pub cache_creation_input_tokens: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DebugTraceOutcomeRecord {
-    #[schemars(required)]
     pub status: String,
-    #[schemars(required)]
     pub reason: Option<String>,
-    #[schemars(required)]
     pub entries: Option<usize>,
-    #[schemars(required)]
     pub output_path: Option<String>,
 }
 

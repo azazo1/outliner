@@ -22,9 +22,9 @@ use crate::{
     config::{AppArgs, CliArgs, resolve_args},
     debug_trace::DebugTraceRecorder,
     llm::{
-        LlmCall, LlmConfig, TocPageAssessmentBatch, VisionPageObservation, VisionRequestConfig,
-        extract_toc_from_markdown, identify_toc_pages, infer_toc_from_page_text,
-        observe_page_labels, review_toc_visual_gaps, transcribe_toc_pages_to_markdown,
+        LlmCall, LlmConfig, VisionPageObservation, VisionRequestConfig, extract_toc_from_markdown,
+        identify_toc_pages, infer_toc_from_page_text, observe_page_labels, review_toc_visual_gaps,
+        transcribe_toc_pages_to_markdown,
     },
     model::{
         DebugTraceStageRecord, DebugTraceUsageSnapshot, ExtractedPageText, OutlineEntry, PageRange,
@@ -1180,12 +1180,7 @@ async fn try_discover_toc_range_from_text(
     agent_progress.record(usage, calls);
     drop(infer_span);
 
-    let batch = TocPageAssessmentBatch {
-        toc_found: data.toc_found,
-        notes: data.notes,
-        assessments: data.assessments,
-    };
-    let hit_count = batch
+    let hit_count = data
         .assessments
         .iter()
         .filter(|assessment| is_toc_hit(assessment))
@@ -1198,7 +1193,7 @@ async fn try_discover_toc_range_from_text(
     );
 
     if hit_count > 0 {
-        let refined = workspace.refine_toc_range(toc_hint, &batch);
+        let refined = workspace.refine_toc_range(toc_hint, &data);
         tracing::info!(
             search_start = candidate_range.start,
             search_end = candidate_range.end,
@@ -1210,7 +1205,7 @@ async fn try_discover_toc_range_from_text(
         return Ok(refined);
     }
 
-    let next_range = workspace.narrow_toc_search_range(candidate_range, &batch);
+    let next_range = workspace.narrow_toc_search_range(candidate_range, &data);
     tracing::info!(
         search_start = candidate_range.start,
         search_end = candidate_range.end,

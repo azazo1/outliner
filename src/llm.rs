@@ -217,8 +217,6 @@ struct TocAssessmentAnswerBatch {
     assessments: Vec<TocPageAssessmentAnswer>,
 }
 
-pub type TocTextInferenceBatch = TocPageAssessmentBatch;
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VisionPageObservation {
     #[schemars(required)]
@@ -237,12 +235,6 @@ struct ObservedPrintedPageLabel {
 struct VisionPageObservationBatch {
     #[schemars(required)]
     observations: Vec<ObservedPrintedPageLabel>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct TocMarkdownPageBatch {
-    #[schemars(required)]
-    pages: Vec<TocPageMarkdown>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -328,7 +320,7 @@ pub async fn infer_toc_from_page_text(
     progress_span: Option<&Span>,
     progress_label: &str,
     trace_recorder: Option<&DebugTraceRecorder>,
-) -> Result<LlmCall<TocTextInferenceBatch>> {
+) -> Result<LlmCall<TocPageAssessmentBatch>> {
     if pages.is_empty() {
         bail!("no extracted page text was provided to the TOC text locator");
     }
@@ -356,7 +348,7 @@ pub async fn infer_toc_from_page_text(
     )?;
 
     Ok(LlmCall {
-        data: TocTextInferenceBatch {
+        data: TocPageAssessmentBatch {
             toc_found: response.data.toc_found,
             notes: response.data.notes,
             assessments,
@@ -489,9 +481,7 @@ pub async fn transcribe_toc_pages_to_markdown(
                     Some(page_range_label.clone()),
                 )
                 .await?;
-                let page_batch = TocMarkdownPageBatch {
-                    pages: bind_toc_markdown_pages(&batch.pages, &response.data.pages)?,
-                };
+                let bound_pages = bind_toc_markdown_pages(&batch.pages, &response.data.pages)?;
 
                 let finished_batches = completed_batches.fetch_add(1, Ordering::Relaxed) + 1;
                 let finished_pages = completed_pages
@@ -514,7 +504,7 @@ pub async fn transcribe_toc_pages_to_markdown(
                 results.push(BatchResult {
                     index: batch.index,
                     response: LlmCall {
-                        data: page_batch,
+                        data: bound_pages,
                         usage: response.usage,
                         calls: response.calls,
                         trace: response.trace,
@@ -546,7 +536,7 @@ pub async fn transcribe_toc_pages_to_markdown(
     let merged = merge_toc_markdown_batches(
         ordered
             .into_iter()
-            .flat_map(|(_, batch)| batch.pages.into_iter())
+            .flat_map(|(_, pages)| pages.into_iter())
             .collect(),
     )?;
 
