@@ -24,7 +24,7 @@ use std::{
 use tracing::Span;
 use unicode_width::UnicodeWidthChar;
 
-use crate::model::{ExtractedPageText, RenderedPage, TocExtraction};
+use crate::model::{ExtractedPageText, RenderedPage, TocCandidateEntry, TocExtraction};
 use crate::progress::{set_spinner_message, start_spinner};
 
 const OUTPUT_WINDOW_LEN: usize = 44;
@@ -46,6 +46,23 @@ Rules:
 - Do not paraphrase, translate, shorten, normalize, or drop any part of a title.
 - Do not invent missing titles, levels, or page labels.
 - Ignore running headers, footers, and body text that is not part of the table of contents.
+"#;
+
+const TOC_HIERARCHY_PREAMBLE: &str = r#"
+You reorganize the hierarchy levels of an already extracted PDF table of contents.
+
+Rules:
+- The input is an extracted TOC entry sequence in reading order.
+- Keep every entry in the same order.
+- Keep every title exactly unchanged.
+- Keep every page_label exactly unchanged.
+- Only adjust the level field.
+- Use global context across the full entry list. Do not reset subentries to level 1 just because a page break hid their parent on that page.
+- Use numbering patterns, chapter or section markers, and neighboring entries to infer the intended hierarchy.
+- Top-level entries must use level = 1.
+- Prefer a contiguous hierarchy. Do not jump deeper than one level unless the surrounding entries make that unavoidable.
+- Do not invent, delete, merge, split, or rewrite entries.
+- Return the same number of entries as the input.
 "#;
 
 const TOC_DISCOVERY_PREAMBLE: &str = r#"
@@ -139,6 +156,14 @@ pub struct TocTextInferenceBatch {
     pub notes: Option<String>,
     #[schemars(required)]
     pub assessments: Vec<TocPageAssessment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TocHierarchyOrganization {
+    #[schemars(required)]
+    pub entries: Vec<TocCandidateEntry>,
+    #[schemars(required)]
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -239,6 +264,30 @@ pub async fn extract_toc(
         },
         merge_toc_extractions,
         EXTRACTION_PREAMBLE,
+        progress_span,
+        progress_label,
+    )
+    .await
+}
+
+pub async fn organize_toc_hierarchy(
+    config: &LlmConfig,
+    entries: &[TocCandidateEntry],
+    progress_span: Option<&Span>,
+    progress_label: &str,
+) -> Result<LlmCall<TocHierarchyOrganization>> {
+    if entries.is_empty() {
+        bail!("no TOC entries were provided to the hierarchy organizer");
+    }
+
+    let prompt = build_toc_hierarchy_message(
+        entries,
+        "Reassign only the hierarchy levels for these extracted TOC entries.",
+    )?;
+    stream_structured_output(
+        config,
+        TOC_HIERARCHY_PREAMBLE,
+        prompt,
         progress_span,
         progress_label,
     )
@@ -457,6 +506,21 @@ fn build_text_page_message(pages: &[ExtractedPageText], instruction: &str) -> Re
 
     Ok(Message::User {
         content: OneOrMany::many(content).context("text prompt cannot be empty")?,
+    })
+}
+
+fn build_toc_hierarchy_message(
+    entries: &[TocCandidateEntry],
+    instruction: &str,
+) -> Result<Message> {
+    let serialized = serde_json::to_string_pretty(entries)
+        .context("failed to serialize TOC entries for hierarchy organization")?;
+    let content = vec![UserContent::text(format!(
+        "{instruction}\n\n---BEGIN TOC ENTRIES JSON---\n{serialized}\n---END TOC ENTRIES JSON---"
+    ))];
+
+    Ok(Message::User {
+        content: OneOrMany::many(content).context("TOC hierarchy prompt cannot be empty")?,
     })
 }
 

@@ -20,10 +20,11 @@ use crate::{
     config::{AppArgs, CliArgs, resolve_args},
     llm::{
         LlmCall, LlmConfig, TocPageAssessmentBatch, VisionRequestConfig, extract_toc,
-        identify_toc_pages, infer_toc_from_page_text, observe_page_labels,
+        identify_toc_pages, infer_toc_from_page_text, observe_page_labels, organize_toc_hierarchy,
     },
     model::{
-        OutlineEntry, PageRange, RunOutcome, normalize_outline_for_compare, normalize_toc_entries,
+        OutlineEntry, PageRange, RunOutcome, TocCandidateEntry, normalize_outline_for_compare,
+        normalize_toc_entries,
     },
     pdf_support::{PdfWorkspace, is_toc_hit},
     progress::{
@@ -210,8 +211,8 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         toc_pages.len() as u64,
         format!("rendering TOC pages {}", toc_pages.len()),
     );
-    let rendered_toc_pages =
-        workspace.render_pages_with_progress(&toc_pages, |completed, physical_page| {
+    let rendered_toc_pages = workspace
+        .render_pages_with_progress(&toc_pages, |completed, physical_page| {
             toc_render_span.pb_set_position(completed as u64);
             set_bar_message(
                 &toc_render_span,
@@ -284,7 +285,51 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         agent_progress.calls,
     );
     let toc_heading_page = workspace.toc_heading_page(&extracted);
-    let toc_entries = normalize_toc_entries(extracted.entries);
+    set_run_status(
+        &run_span,
+        &args.input,
+        "organizing TOC hierarchy",
+        &agent_progress.usage,
+        agent_progress.calls,
+    );
+    let organize_span = start_spinner("organize_toc_hierarchy", "organizing TOC hierarchy");
+    let organize_message = format!(
+        "organizing TOC hierarchy from {} extracted entries",
+        extracted.entries.len()
+    );
+    let reorganized_entries = if extracted.entries.is_empty() {
+        Vec::new()
+    } else {
+        let LlmCall {
+            data: organized,
+            usage,
+            calls,
+        } = organize_toc_hierarchy(
+            &llm_config,
+            &extracted.entries,
+            Some(&organize_span),
+            &organize_message,
+        )
+        .instrument(organize_span.clone())
+        .await?;
+        agent_progress.record(usage, calls);
+        reconcile_toc_hierarchy_entries(&extracted.entries, organized.entries)
+    };
+    tracing::info!(
+        extracted_entry_count = extracted.entries.len(),
+        reorganized_entry_count = reorganized_entries.len(),
+        toc_heading_page = ?toc_heading_page,
+        "TOC hierarchy organized"
+    );
+    drop(organize_span);
+    finish_stage(
+        &run_span,
+        &args.input,
+        "TOC hierarchy organized",
+        &agent_progress.usage,
+        agent_progress.calls,
+    );
+    let toc_entries = normalize_toc_entries(reorganized_entries);
     tracing::info!(
         normalized_entry_count = toc_entries.len(),
         toc_heading_page = ?toc_heading_page,
@@ -329,8 +374,8 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         label_pages.len() as u64,
         format!("rendering page number samples {}", label_pages.len()),
     );
-    let rendered_label_pages =
-        workspace.render_pages_with_progress(&label_pages, |completed, physical_page| {
+    let rendered_label_pages = workspace
+        .render_pages_with_progress(&label_pages, |completed, physical_page| {
             label_render_span.pb_set_position(completed as u64);
             set_bar_message(
                 &label_render_span,
@@ -659,7 +704,10 @@ async fn discover_toc_range(
         let ocr_span = start_bar(
             "ocr_toc_samples",
             discovery_pages.len() as u64,
-            format!("OCRing TOC samples {}..{}", candidate_range.start, candidate_range.end),
+            format!(
+                "OCRing TOC samples {}..{}",
+                candidate_range.start, candidate_range.end
+            ),
         );
         match workspace
             .ocr_page_text_with_progress(&discovery_pages, |completed, physical_page| {
@@ -1002,10 +1050,46 @@ fn same_path(left: &Path, right: &Path) -> bool {
 
 fn stage_count_for(args: &AppArgs) -> u64 {
     if args.toc.is_some_and(|spec| spec.is_fully_bounded()) {
-        8
+        9
     } else {
-        10
+        11
     }
+}
+
+fn reconcile_toc_hierarchy_entries(
+    original_entries: &[TocCandidateEntry],
+    reorganized_entries: Vec<TocCandidateEntry>,
+) -> Vec<TocCandidateEntry> {
+    if reorganized_entries.len() != original_entries.len() {
+        tracing::warn!(
+            original_entries = original_entries.len(),
+            reorganized_entries = reorganized_entries.len(),
+            "organized TOC entry count changed; falling back to original extraction"
+        );
+        return original_entries.to_vec();
+    }
+
+    let mut reconciled = Vec::with_capacity(original_entries.len());
+    for (original, reorganized) in original_entries.iter().zip(reorganized_entries) {
+        if original.title != reorganized.title || original.page_label != reorganized.page_label {
+            tracing::warn!(
+                original_title = %original.title,
+                reorganized_title = %reorganized.title,
+                original_page_label = %original.page_label,
+                reorganized_page_label = %reorganized.page_label,
+                "organized TOC entry changed title or page label; falling back to original extraction"
+            );
+            return original_entries.to_vec();
+        }
+
+        reconciled.push(TocCandidateEntry {
+            title: original.title.clone(),
+            page_label: original.page_label.clone(),
+            level: reorganized.level.max(1),
+        });
+    }
+
+    reconciled
 }
 
 fn ensure_toc_heading_entry(
@@ -1048,11 +1132,12 @@ fn is_toc_heading_title(title: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_toc_heading_entry, format_rendered_page_range, is_toc_heading_title, stage_count_for,
+        ensure_toc_heading_entry, format_rendered_page_range, is_toc_heading_title,
+        reconcile_toc_hierarchy_entries, stage_count_for,
     };
     use crate::{
         config::AppArgs,
-        model::{OutlineEntry, PageRangeSpec, RenderedPage},
+        model::{OutlineEntry, PageRangeSpec, RenderedPage, TocCandidateEntry},
     };
     use std::path::PathBuf;
 
@@ -1120,7 +1205,59 @@ mod tests {
             vision_workers: 4,
             external_process_concurrency: 4,
         };
-        assert_eq!(stage_count_for(&args), 8);
+        assert_eq!(stage_count_for(&args), 9);
+    }
+
+    #[test]
+    fn reconcile_toc_hierarchy_rejects_title_changes() {
+        let original = vec![TocCandidateEntry {
+            title: "1.1 HDL".to_string(),
+            level: 1,
+            page_label: "20".to_string(),
+        }];
+        let reorganized = vec![TocCandidateEntry {
+            title: "1.1 Verilog HDL".to_string(),
+            level: 2,
+            page_label: "20".to_string(),
+        }];
+
+        let reconciled = reconcile_toc_hierarchy_entries(&original, reorganized);
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0].title, original[0].title);
+        assert_eq!(reconciled[0].page_label, original[0].page_label);
+        assert_eq!(reconciled[0].level, original[0].level);
+    }
+
+    #[test]
+    fn reconcile_toc_hierarchy_keeps_only_level_changes() {
+        let original = vec![
+            TocCandidateEntry {
+                title: "1.2 Verilog HDL 的历史".to_string(),
+                level: 1,
+                page_label: "21".to_string(),
+            },
+            TocCandidateEntry {
+                title: "1.2.1 什么是 Verilog HDL".to_string(),
+                level: 1,
+                page_label: "21".to_string(),
+            },
+        ];
+        let reorganized = vec![
+            TocCandidateEntry {
+                title: "1.2 Verilog HDL 的历史".to_string(),
+                level: 1,
+                page_label: "21".to_string(),
+            },
+            TocCandidateEntry {
+                title: "1.2.1 什么是 Verilog HDL".to_string(),
+                level: 2,
+                page_label: "21".to_string(),
+            },
+        ];
+
+        let reconciled = reconcile_toc_hierarchy_entries(&original, reorganized);
+        assert_eq!(reconciled[0].level, 1);
+        assert_eq!(reconciled[1].level, 2);
     }
 
     #[test]

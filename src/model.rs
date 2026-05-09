@@ -130,6 +130,7 @@ pub enum RunOutcome {
 pub fn normalize_toc_entries(entries: Vec<TocCandidateEntry>) -> Vec<TocCandidateEntry> {
     let mut normalized = Vec::new();
     let mut previous_level = 1usize;
+    let mut previous_numbering = None;
 
     for mut entry in entries {
         let title = clean_title(&entry.title);
@@ -141,8 +142,28 @@ pub fn normalize_toc_entries(entries: Vec<TocCandidateEntry>) -> Vec<TocCandidat
         let mut level = usize::from(entry.level.max(1));
         if normalized.is_empty() {
             level = 1;
-        } else if level > previous_level + 1 {
-            level = previous_level + 1;
+        } else {
+            if let Some(numbering) = extract_leading_numbering(&title) {
+                if let Some(previous) = previous_numbering.as_ref() {
+                    if numbering.is_direct_child_of(previous) {
+                        level = previous_level + 1;
+                    } else if numbering.has_same_parent_as(previous) {
+                        level = previous_level;
+                    } else if let Some(parent_level) = numbering
+                        .parent()
+                        .and_then(|parent| find_numbering_level(&normalized, &parent))
+                    {
+                        level = parent_level + 1;
+                    }
+                }
+                previous_numbering = Some(numbering);
+            } else {
+                previous_numbering = None;
+            }
+
+            if level > previous_level + 1 {
+                level = previous_level + 1;
+            }
         }
 
         entry.title = title;
@@ -237,6 +258,44 @@ fn extract_roman_page_number(value: &str) -> Option<String> {
         .filter(|roman| is_roman_numeral(roman))
 }
 
+fn find_numbering_level(
+    entries: &[TocCandidateEntry],
+    numbering: &SectionNumbering,
+) -> Option<usize> {
+    entries.iter().rev().find_map(|entry| {
+        let title_numbering = extract_leading_numbering(&entry.title)?;
+        (title_numbering == *numbering).then(|| usize::from(entry.level))
+    })
+}
+
+fn extract_leading_numbering(title: &str) -> Option<SectionNumbering> {
+    let re = Regex::new(r"^\s*(\d+(?:\.\d+)+)(?:[.)-]|\s|$)").expect("section numbering regex");
+    let captures = re.captures(title)?;
+    let matched = captures.get(1)?.as_str();
+    let parts = matched
+        .split('.')
+        .map(|part| part.parse::<usize>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    (parts.len() >= 2).then_some(SectionNumbering(parts))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SectionNumbering(Vec<usize>);
+
+impl SectionNumbering {
+    fn parent(&self) -> Option<Self> {
+        (self.0.len() > 1).then(|| Self(self.0[..self.0.len() - 1].to_vec()))
+    }
+
+    fn has_same_parent_as(&self, other: &Self) -> bool {
+        self.parent() == other.parent()
+    }
+
+    fn is_direct_child_of(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len() + 1 && self.0.starts_with(&other.0)
+    }
+}
+
 fn roman_to_number(value: &str) -> Option<usize> {
     let mut total = 0usize;
     let mut previous = 0usize;
@@ -267,8 +326,8 @@ fn roman_to_number(value: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PageLabel, PageRange, PageRangeSpec, TocCandidateEntry, clean_title, normalize_toc_entries,
-        parse_page_label, sanitize_title,
+        PageLabel, PageRange, PageRangeSpec, TocCandidateEntry, clean_title,
+        extract_leading_numbering, normalize_toc_entries, parse_page_label, sanitize_title,
     };
 
     #[test]
@@ -289,6 +348,45 @@ mod tests {
         let normalized = normalize_toc_entries(entries);
         assert_eq!(normalized[0].level, 1);
         assert_eq!(normalized[1].level, 2);
+    }
+
+    #[test]
+    fn normalize_uses_numbering_to_recover_missing_parent_context() {
+        let entries = vec![
+            TocCandidateEntry {
+                title: "1.1 Hardware Description Language HDL".to_string(),
+                level: 1,
+                page_label: "20".to_string(),
+            },
+            TocCandidateEntry {
+                title: "1.2 Verilog HDL 的历史".to_string(),
+                level: 1,
+                page_label: "21".to_string(),
+            },
+            TocCandidateEntry {
+                title: "1.2.1 什么是 Verilog HDL".to_string(),
+                level: 1,
+                page_label: "21".to_string(),
+            },
+            TocCandidateEntry {
+                title: "1.3 Verilog HDL 和 VHDL".to_string(),
+                level: 1,
+                page_label: "22".to_string(),
+            },
+        ];
+
+        let normalized = normalize_toc_entries(entries);
+        assert_eq!(normalized[0].level, 1);
+        assert_eq!(normalized[1].level, 1);
+        assert_eq!(normalized[2].level, 2);
+        assert_eq!(normalized[3].level, 1);
+    }
+
+    #[test]
+    fn extract_leading_numbering_reads_nested_decimal_prefix() {
+        let numbering =
+            extract_leading_numbering("1.2.3 Verilog HDL").expect("expected decimal numbering");
+        assert_eq!(numbering.0, vec![1, 2, 3]);
     }
 
     #[test]
