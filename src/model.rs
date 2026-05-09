@@ -176,20 +176,23 @@ impl PageRangeSpec {
 pub struct TocExtraction {
     #[schemars(
         required,
-        description = "当你从提供的材料中找到了目录的时候, 请返回 true, 并填写 first_toc_page 和 last_toc_page"
+        description = "True when the provided combined markdown contains a real table of contents."
     )]
     pub toc_found: bool,
     #[schemars(
         required,
-        description = "TOC 第一页在哪? 你需要在 `# TOC Page <N>` 中提取 N 来填写. 当 toc_found = true 的时候不应该为空."
+        description = "The PDF physical page number from the `# TOC Page <N>` heading where the table of contents starts. Do not use the printed TOC page label here."
     )]
     pub first_toc_page: Option<usize>,
     #[schemars(
         required,
-        description = "TOC 最后一页在哪? 你需要在 `# TOC Page <N>` 中提取 N 来填写. 当 toc_found = true 的时候不应该为空."
+        description = "The PDF physical page number from the `# TOC Page <N>` heading where the table of contents ends. Do not use the printed TOC page label here."
     )]
     pub last_toc_page: Option<usize>,
-    #[schemars(required)]
+    #[schemars(
+        required,
+        description = "The extracted TOC entries. Use this field name, not `toc`."
+    )]
     pub entries: Vec<TocCandidateEntry>,
     #[schemars(required)]
     pub notes: Option<String>,
@@ -203,7 +206,10 @@ pub struct TocCandidateEntry {
     pub title: String,
     #[schemars(required)]
     pub level: u8,
-    #[schemars(required)]
+    #[schemars(
+        required,
+        description = "The printed TOC page label exactly as shown on the TOC line. This is not the PDF physical page number."
+    )]
     pub page: String,
 }
 

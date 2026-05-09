@@ -87,6 +87,9 @@ const TOC_MARKDOWN_TRANSCRIPTION_PREAMBLE: &str = r#"
 You transcribe PDF table-of-contents pages into high-fidelity markdown page records.
 
 Rules:
+- Return a single JSON object that matches the provided schema exactly.
+- The `markdown` value is a JSON string. Put the region blocks inside that string, not in the assistant message body.
+- Do not add `page_records`, `page_number`, `physical_page`, markdown headings outside JSON strings, or any other wrapper fields.
 - Return one page record per input page, in the same order.
 - Hierarchy fidelity is the top priority. Preserve every visible hierarchy cue that distinguishes parent, child, and sibling entries.
 - Preserve all TOC-relevant detail, including indentation, dot leaders, numbering, page labels, column order, boxed headings, side notes, and unusual layout cues.
@@ -108,6 +111,7 @@ const TOC_MARKDOWN_EXTRACTION_PREAMBLE: &str = r#"
 You extract a PDF table of contents from a combined markdown document produced from TOC page transcriptions.
 
 Rules:
+- Return a single JSON object that matches the provided schema exactly.
 - Decide whether the document contains a real TOC.
 - Hierarchy fidelity is the top priority. Recover every visible TOC layer that is supported by the markdown and review notes.
 - Use the markdown page boundaries, layout notes, and region content as the primary evidence.
@@ -120,7 +124,9 @@ Rules:
 - If a visible parent heading and its children both appear in the TOC, output both as separate entries.
 - Use indentation, numbering depth, alignment, leader style, grouping labels, boxed headings, and reading-order notes when restoring levels.
 - Use level = 1 for top-level entries.
+- `first_toc_page` and `last_toc_page` are PDF physical page numbers taken from the `# TOC Page <N>` headings in the combined markdown document.
 - Use the field `page` for the printed TOC page label exactly as shown.
+- Do not use printed TOC page labels for `first_toc_page` or `last_toc_page`.
 - When the markdown is insufficient to restore levels reliably, return a `review_requests` item instead of guessing or collapsing levels.
 - Each review request must include `physical_page`, `reason`, and `line_hint`.
 - After review notes are provided, consume them and return `review_requests = []` unless the TOC is still unreliable.
@@ -244,17 +250,29 @@ struct VisionPageObservationBatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct TocPageMarkdownAnswer {
-    #[schemars(required)]
+    #[schemars(
+        required,
+        description = "A markdown string that starts each visible region with `## Region N (kind)` and places TOC lines inside fenced `text` blocks. Keep all region markup inside this JSON string."
+    )]
     markdown: String,
-    #[schemars(required)]
+    #[schemars(
+        required,
+        description = "A compact summary of the page layout, reading order, and every distinct visible hierarchy cue on the page."
+    )]
     layout_notes: String,
-    #[schemars(required)]
+    #[schemars(
+        required,
+        description = "Set to true when any TOC fragment needed for faithful extraction is unclear or unreadable."
+    )]
     has_unclear_regions: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct TocMarkdownAnswerBatch {
-    #[schemars(required)]
+    #[schemars(
+        required,
+        description = "One item per input TOC page, in the same order as the input pages. Do not add page numbers or extra wrapper objects."
+    )]
     pages: Vec<TocPageMarkdownAnswer>,
 }
 
@@ -572,7 +590,7 @@ pub async fn extract_toc_from_markdown(
     stage_name: &str,
 ) -> Result<LlmCall<TocExtraction>> {
     let prompt = build_toc_markdown_extraction_message(document, review_results)?;
-    stream_structured_output(
+    let mut response = stream_structured_output(
         config,
         TOC_MARKDOWN_EXTRACTION_PREAMBLE,
         prompt,
@@ -583,7 +601,9 @@ pub async fn extract_toc_from_markdown(
         None,
         page_range_from_toc_markdown_document(document),
     )
-    .await
+    .await?;
+    normalize_toc_extraction_page_window(document, &mut response.data);
+    Ok(response)
 }
 
 pub async fn review_toc_visual_gaps(
@@ -834,13 +854,16 @@ fn build_multimodal_message(pages: &[RenderedPage], instruction: &str) -> Result
 
 fn build_toc_markdown_transcription_message(pages: &[TocPageEvidence]) -> Result<Message> {
     let mut content = Vec::with_capacity(1 + pages.len() * 4);
-    content.push(UserContent::text(
-        "Transcribe each TOC page into a standalone high-fidelity markdown page record.",
-    ));
+    content.push(UserContent::text(format!(
+        "Transcribe each TOC page into a standalone high-fidelity markdown page record. Return JSON only. The top-level object must be `{{\"pages\":[...]}}`. The `pages` array must contain exactly {} items in the same order as the input pages. Each item may contain only `markdown`, `layout_notes`, and `has_unclear_regions`. Put region blocks inside the `markdown` string, not in the assistant message body. Do not add `page_records`, `page_number`, or `physical_page`.",
+        pages.len()
+    )));
 
-    for page in pages {
+    for (index, page) in pages.iter().enumerate() {
         content.push(UserContent::text(format!(
-            "PDF physical page {}\n---BEGIN PDF TEXT---\n{}\n---END PDF TEXT---",
+            "Input page {} of {}. PDF physical page {}.\n---BEGIN PDF TEXT---\n{}\n---END PDF TEXT---",
+            index + 1,
+            pages.len(),
             page.physical_page,
             page.pdf_text.as_deref().unwrap_or("[[none]]"),
         )));
@@ -879,9 +902,17 @@ fn build_toc_markdown_extraction_message(
     document: &TocMarkdownDocument,
     review_results: &[VisualReviewResult],
 ) -> Result<Message> {
+    let page_window_note = toc_markdown_document_page_window(document)
+        .map(|(first, last)| {
+            format!(
+                "The combined markdown document covers PDF physical TOC pages {}. Use those physical page numbers for `first_toc_page` and `last_toc_page`. Use printed labels only inside `entries[*].page`.",
+                format_page_window(first, last)
+            )
+        })
+        .unwrap_or_default();
     let mut body = format!(
-        "Extract the TOC from this combined markdown document.\n\n---BEGIN TOC MARKDOWN---\n{}\n---END TOC MARKDOWN---",
-        document.combined_markdown
+        "Extract the TOC from this combined markdown document. Return JSON only. Use the top-level keys `toc_found`, `first_toc_page`, `last_toc_page`, `entries`, `notes`, and `review_requests`. Use `entries`, not `toc`. {}\n\n---BEGIN TOC MARKDOWN---\n{}\n---END TOC MARKDOWN---",
+        page_window_note, document.combined_markdown,
     );
     if let Some(review_appendix) = format_toc_review_appendix(review_results) {
         body.push_str("\n\n");
@@ -924,6 +955,58 @@ fn build_visual_review_message(
     Ok(Message::User {
         content: OneOrMany::many(content).context("visual review prompt cannot be empty")?,
     })
+}
+
+fn toc_markdown_document_page_window(document: &TocMarkdownDocument) -> Option<(usize, usize)> {
+    let first = document.pages.iter().map(|page| page.physical_page).min()?;
+    let last = document.pages.iter().map(|page| page.physical_page).max()?;
+    Some((first, last))
+}
+
+fn format_page_window(first: usize, last: usize) -> String {
+    if first == last {
+        first.to_string()
+    } else {
+        format!("{first}..{last}")
+    }
+}
+
+fn normalize_toc_extraction_page_window(
+    document: &TocMarkdownDocument,
+    extraction: &mut TocExtraction,
+) {
+    let Some((first, last)) = toc_markdown_document_page_window(document) else {
+        return;
+    };
+
+    if !extraction.toc_found {
+        extraction.first_toc_page = None;
+        extraction.last_toc_page = None;
+        return;
+    }
+
+    let needs_normalization = match (extraction.first_toc_page, extraction.last_toc_page) {
+        (Some(model_first), Some(model_last)) => {
+            model_first < first
+                || model_first > last
+                || model_last < first
+                || model_last > last
+                || model_first > model_last
+        }
+        _ => true,
+    };
+
+    if needs_normalization {
+        tracing::warn!(
+            model_first_toc_page = ?extraction.first_toc_page,
+            model_last_toc_page = ?extraction.last_toc_page,
+            normalized_first_toc_page = first,
+            normalized_last_toc_page = last,
+            "normalizing extracted TOC physical page window from document headers"
+        );
+        extraction.first_toc_page = Some(first);
+        extraction.last_toc_page = Some(last);
+    }
 }
 
 fn build_openai_client(config: &LlmConfig) -> Result<openai::CompletionsClient> {
@@ -2164,11 +2247,13 @@ mod tests {
         TocPageAssessmentAnswer, TocPageMarkdownAnswer, VisionRequestConfig, VisualReviewAnswer,
         batch_page_range_label, bind_page_label_observations, bind_toc_markdown_pages,
         bind_toc_page_assessments, bind_visual_review_results, build_openai_client, display_width,
-        identify_toc_pages, repair_progress_label, should_retry_llm_error, take_prefix_width,
-        take_suffix_width,
+        identify_toc_pages, normalize_toc_extraction_page_window, repair_progress_label,
+        should_retry_llm_error, take_prefix_width, take_suffix_width,
     };
     use crate::config::{CliArgs, resolve_args};
-    use crate::model::{TocPageEvidence, TocPageMarkdown, VisualReviewRequest};
+    use crate::model::{
+        TocExtraction, TocMarkdownDocument, TocPageEvidence, TocPageMarkdown, VisualReviewRequest,
+    };
     use crate::pdf_support::PdfWorkspace;
     use crate::qpdf_outline::open_pdf;
 
@@ -2268,6 +2353,60 @@ mod tests {
             repair_progress_label("extracting TOC from markdown"),
             "extracting TOC from markdown | repairing"
         );
+    }
+
+    #[test]
+    fn normalize_toc_extraction_page_window_replaces_out_of_range_model_pages() {
+        let document = TocMarkdownDocument::from_pages(vec![
+            TocPageMarkdown {
+                physical_page: 7,
+                markdown: "## Region 1 (toc)\n```text\nA\n```".to_string(),
+                layout_notes: "single column".to_string(),
+                has_unclear_regions: false,
+            },
+            TocPageMarkdown {
+                physical_page: 9,
+                markdown: "## Region 1 (toc)\n```text\nB\n```".to_string(),
+                layout_notes: "single column".to_string(),
+                has_unclear_regions: false,
+            },
+        ]);
+        let mut extraction = TocExtraction {
+            toc_found: true,
+            first_toc_page: Some(1),
+            last_toc_page: Some(66),
+            entries: Vec::new(),
+            notes: None,
+            review_requests: Vec::new(),
+        };
+
+        normalize_toc_extraction_page_window(&document, &mut extraction);
+
+        assert_eq!(extraction.first_toc_page, Some(7));
+        assert_eq!(extraction.last_toc_page, Some(9));
+    }
+
+    #[test]
+    fn normalize_toc_extraction_page_window_clears_pages_when_toc_is_not_found() {
+        let document = TocMarkdownDocument::from_pages(vec![TocPageMarkdown {
+            physical_page: 4,
+            markdown: "## Region 1 (toc)\n```text\nA\n```".to_string(),
+            layout_notes: "single column".to_string(),
+            has_unclear_regions: false,
+        }]);
+        let mut extraction = TocExtraction {
+            toc_found: false,
+            first_toc_page: Some(4),
+            last_toc_page: Some(4),
+            entries: Vec::new(),
+            notes: Some("not a toc".to_string()),
+            review_requests: Vec::new(),
+        };
+
+        normalize_toc_extraction_page_window(&document, &mut extraction);
+
+        assert_eq!(extraction.first_toc_page, None);
+        assert_eq!(extraction.last_toc_page, None);
     }
 
     #[tokio::test]
