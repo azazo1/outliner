@@ -14,7 +14,7 @@ use schemars::JsonSchema;
 use schemars::schema_for;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -24,7 +24,7 @@ use std::{
 use tracing::Span;
 use unicode_width::UnicodeWidthChar;
 
-use crate::model::{ExtractedPageText, RenderedPage, TocCandidateEntry, TocExtraction};
+use crate::model::{ExtractedPageText, RenderedPage, TocExtraction};
 use crate::progress::{set_spinner_message, start_spinner};
 
 const OUTPUT_WINDOW_LEN: usize = 44;
@@ -64,21 +64,21 @@ Rules:
 - Do not invent hidden parents, missing entries, or unsupported levels.
 "#;
 
-const TOC_HIERARCHY_PREAMBLE: &str = r#"
-You reorganize the hierarchy levels of an already extracted PDF table of contents.
+const TOC_STRUCTURE_GUIDE_PREAMBLE: &str = r#"
+You consolidate merged table-of-contents structure evidence into a final normalized hierarchy guide.
 
 Rules:
-- The input is an extracted TOC entry sequence in reading order.
-- Keep every entry in the same order.
-- Keep every title exactly unchanged.
-- Keep every `page` value exactly unchanged.
-- Only adjust the level field.
-- Use global context across the full entry list. Do not reset subentries to level 1 just because a page break hid their parent on that page.
-- Use numbering patterns, chapter or section markers, and neighboring entries to infer the intended hierarchy.
+- The input is merged structure evidence from all TOC page batches.
+- Produce one final guide record per level.
+- Return toc_found = false, levels = [], and notes explaining why when useful if the merged evidence does not support a real TOC.
 - Top-level entries must use level = 1.
-- Prefer a contiguous hierarchy. Do not jump deeper than one level unless the surrounding entries make that unavoidable.
-- Do not invent, delete, merge, split, or rewrite entries.
-- Return the same number of entries as the input.
+- Use parent_level = null only for top-level entries. Every other level must reference a lower existing level.
+- Use description to summarize the stable cues that distinguish the level.
+- Use numbering_patterns for short canonical patterns such as `1`, `1.1`, `I`, `Chapter N`, `Appendix A`, or `none`.
+- Keep examples short and copied exactly from the merged evidence.
+- Preserve coverage. If the merged evidence contains a real observed level, do not drop it unless notes clearly explain why it was noise.
+- Resolve overlapping or conflicting cues into one normalized guide.
+- Do not invent unsupported levels or impossible parent relationships.
 "#;
 
 const TOC_DISCOVERY_PREAMBLE: &str = r#"
@@ -174,14 +174,6 @@ pub struct TocTextInferenceBatch {
     pub assessments: Vec<TocPageAssessment>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct TocHierarchyOrganization {
-    #[schemars(required)]
-    pub entries: Vec<TocCandidateEntry>,
-    #[schemars(required)]
-    pub notes: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct TocStructureLevel {
     #[schemars(required)]
@@ -200,6 +192,32 @@ pub struct TocStructureExtraction {
     pub notes: Option<String>,
     #[schemars(required)]
     pub levels: Vec<TocStructureLevel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct TocStructureGuideLevel {
+    #[schemars(required)]
+    pub level: u8,
+    #[schemars(required)]
+    pub parent_level: Option<u8>,
+    #[schemars(required)]
+    pub description: String,
+    #[schemars(required)]
+    pub numbering_patterns: Vec<String>,
+    #[schemars(required)]
+    pub examples: Vec<String>,
+    #[schemars(required)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct TocStructureGuide {
+    #[schemars(required)]
+    pub toc_found: bool,
+    #[schemars(required)]
+    pub notes: Option<String>,
+    #[schemars(required)]
+    pub levels: Vec<TocStructureGuideLevel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -280,7 +298,7 @@ pub async fn extract_toc(
     config: &LlmConfig,
     request_config: VisionRequestConfig,
     pages: &[RenderedPage],
-    structure: Option<&TocStructureExtraction>,
+    guide: Option<&TocStructureGuide>,
     progress_span: Option<&Span>,
     progress_label: &str,
 ) -> Result<LlmCall<TocExtraction>> {
@@ -288,7 +306,7 @@ pub async fn extract_toc(
         bail!("no candidate pages were provided to the LLM extractor");
     }
 
-    let instruction = Arc::<str>::from(build_toc_extraction_instruction(structure)?);
+    let instruction = Arc::<str>::from(build_toc_extraction_instruction(guide)?);
     let batches = chunk_rendered_pages(pages, request_config.batch_size);
     stream_batched_structured_output(
         config,
@@ -299,6 +317,34 @@ pub async fn extract_toc(
         },
         merge_toc_extractions,
         EXTRACTION_PREAMBLE,
+        progress_span,
+        progress_label,
+    )
+    .await
+}
+
+pub async fn organize_toc_structure(
+    config: &LlmConfig,
+    structure: &TocStructureExtraction,
+    progress_span: Option<&Span>,
+    progress_label: &str,
+) -> Result<LlmCall<TocStructureGuide>> {
+    if !structure.toc_found || structure.levels.is_empty() {
+        return Ok(LlmCall {
+            data: build_fallback_toc_structure_guide(structure),
+            usage: Usage::new(),
+            calls: 0,
+        });
+    }
+
+    let prompt = build_toc_structure_guide_message(
+        structure,
+        "Consolidate this merged TOC structure evidence into one final normalized hierarchy guide.",
+    )?;
+    stream_structured_output(
+        config,
+        TOC_STRUCTURE_GUIDE_PREAMBLE,
+        prompt,
         progress_span,
         progress_label,
     )
@@ -329,30 +375,6 @@ pub async fn extract_toc_structure(
         },
         merge_toc_structure_extractions,
         TOC_STRUCTURE_PREAMBLE,
-        progress_span,
-        progress_label,
-    )
-    .await
-}
-
-pub async fn organize_toc_hierarchy(
-    config: &LlmConfig,
-    entries: &[TocCandidateEntry],
-    progress_span: Option<&Span>,
-    progress_label: &str,
-) -> Result<LlmCall<TocHierarchyOrganization>> {
-    if entries.is_empty() {
-        bail!("no TOC entries were provided to the hierarchy organizer");
-    }
-
-    let prompt = build_toc_hierarchy_message(
-        entries,
-        "Reassign only the hierarchy levels for these extracted TOC entries.",
-    )?;
-    stream_structured_output(
-        config,
-        TOC_HIERARCHY_PREAMBLE,
-        prompt,
         progress_span,
         progress_label,
     )
@@ -629,26 +651,123 @@ fn build_multimodal_message(pages: &[RenderedPage], instruction: &str) -> Result
     })
 }
 
+pub fn build_fallback_toc_structure_guide(structure: &TocStructureExtraction) -> TocStructureGuide {
+    let levels = structure
+        .levels
+        .iter()
+        .map(|level| TocStructureGuideLevel {
+            level: level.level.max(1),
+            parent_level: (level.level > 1).then_some(level.level - 1),
+            description: collapse_inline_whitespace(&level.description),
+            numbering_patterns: infer_numbering_patterns_from_examples(&level.examples),
+            examples: level
+                .examples
+                .iter()
+                .map(|example| collapse_inline_whitespace(example))
+                .filter(|example| !example.is_empty())
+                .take(3)
+                .collect(),
+            notes: Some("fallback guide derived from merged batch structure".to_string()),
+        })
+        .collect();
+
+    TocStructureGuide {
+        toc_found: structure.toc_found,
+        notes: structure
+            .notes
+            .as_ref()
+            .map(|notes| collapse_inline_whitespace(notes)),
+        levels,
+    }
+}
+
+pub fn guide_covers_structure(
+    structure: &TocStructureExtraction,
+    guide: &TocStructureGuide,
+) -> bool {
+    let structure_levels = structure
+        .levels
+        .iter()
+        .filter_map(|level| (!level.description.trim().is_empty()).then_some(level.level.max(1)))
+        .collect::<BTreeSet<_>>();
+    let guide_levels = guide
+        .levels
+        .iter()
+        .filter_map(|level| (!level.description.trim().is_empty()).then_some(level.level.max(1)))
+        .collect::<BTreeSet<_>>();
+
+    structure_levels.is_subset(&guide_levels)
+}
+
+pub fn toc_structure_guide_is_reliable(
+    structure: &TocStructureExtraction,
+    guide: &TocStructureGuide,
+) -> bool {
+    if !guide.toc_found {
+        return !structure.toc_found || structure.levels.is_empty();
+    }
+
+    if guide.levels.is_empty() {
+        return false;
+    }
+
+    let mut seen = BTreeSet::new();
+    for level in &guide.levels {
+        let current_level = level.level.max(1);
+        if !seen.insert(current_level) {
+            return false;
+        }
+        if collapse_inline_whitespace(&level.description).is_empty() {
+            return false;
+        }
+        if current_level == 1 {
+            if level.parent_level.is_some() {
+                return false;
+            }
+        } else {
+            let Some(parent_level) = level.parent_level else {
+                return false;
+            };
+            if parent_level >= current_level || parent_level == 0 {
+                return false;
+            }
+        }
+    }
+
+    if !guide_covers_structure(structure, guide) {
+        return false;
+    }
+
+    for level in &guide.levels {
+        if let Some(parent_level) = level.parent_level
+            && !seen.contains(&parent_level)
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn build_toc_extraction_instruction(
-    structure: Option<&TocStructureExtraction>,
+    guide: Option<&TocStructureGuide>,
 ) -> Result<String> {
     let mut instruction =
         "Determine whether these PDF pages contain a table of contents, then extract it."
             .to_string();
 
-    let Some(structure) = structure
-        .filter(|structure| structure.toc_found && !structure.levels.is_empty())
+    let Some(guide) = guide.filter(|guide| guide.toc_found && !guide.levels.is_empty())
     else {
         return Ok(instruction);
     };
 
-    let serialized = serde_json::to_string_pretty(structure)
-        .context("failed to serialize TOC structure guide for extraction")?;
+    let serialized = serde_json::to_string_pretty(guide)
+        .context("failed to serialize final TOC structure guide for extraction")?;
     instruction.push_str(
-        "\n\nUse this precomputed global TOC structure guide when assigning the `level` field. The guide is aggregated across all TOC page batches, so it may mention parent or sibling levels that are not visible in this specific batch. Use it as a prior only when it matches the visible page.\n\n---BEGIN GLOBAL TOC STRUCTURE JSON---\n",
+        "\n\nUse this final normalized TOC structure guide when assigning the `level` field. Prefer this guide over local page-only guesses. Only deviate when the visible page evidence clearly conflicts with the guide. The guide may mention parent or sibling levels that are not visible in this specific batch.\n\n---BEGIN FINAL TOC STRUCTURE GUIDE JSON---\n",
     );
     instruction.push_str(&serialized);
-    instruction.push_str("\n---END GLOBAL TOC STRUCTURE JSON---");
+    instruction.push_str("\n---END FINAL TOC STRUCTURE GUIDE JSON---");
     Ok(instruction)
 }
 
@@ -676,19 +795,62 @@ fn normalize_structure_description(value: &str) -> String {
     collapse_inline_whitespace(value).to_ascii_lowercase()
 }
 
-fn build_toc_hierarchy_message(
-    entries: &[TocCandidateEntry],
+fn build_toc_structure_guide_message(
+    structure: &TocStructureExtraction,
     instruction: &str,
 ) -> Result<Message> {
-    let serialized = serde_json::to_string_pretty(entries)
-        .context("failed to serialize TOC entries for hierarchy organization")?;
+    let serialized = serde_json::to_string_pretty(structure)
+        .context("failed to serialize merged TOC structure for final organization")?;
     let content = vec![UserContent::text(format!(
-        "{instruction}\n\n---BEGIN TOC ENTRIES JSON---\n{serialized}\n---END TOC ENTRIES JSON---"
+        "{instruction}\n\n---BEGIN MERGED TOC STRUCTURE JSON---\n{serialized}\n---END MERGED TOC STRUCTURE JSON---"
     ))];
 
     Ok(Message::User {
-        content: OneOrMany::many(content).context("TOC hierarchy prompt cannot be empty")?,
+        content: OneOrMany::many(content).context("TOC structure guide prompt cannot be empty")?,
     })
+}
+
+fn infer_numbering_patterns_from_examples(examples: &[String]) -> Vec<String> {
+    let mut patterns = BTreeSet::new();
+    for example in examples {
+        let trimmed = collapse_inline_whitespace(example);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("chapter ") {
+            patterns.insert("Chapter N".to_string());
+        } else if lower.starts_with("appendix ") {
+            patterns.insert("Appendix A".to_string());
+        } else if let Some(prefix) = trimmed.split_whitespace().next() {
+            if prefix
+                .chars()
+                .all(|ch| ch.is_ascii_digit() || ch == '.')
+                && prefix.chars().any(|ch| ch.is_ascii_digit())
+            {
+                patterns.insert(if prefix.contains('.') {
+                    "1.1".to_string()
+                } else {
+                    "1".to_string()
+                });
+                continue;
+            }
+            if prefix.chars().all(|ch| matches!(ch, 'I' | 'V' | 'X' | 'L' | 'C' | 'D' | 'M'))
+                || prefix
+                    .chars()
+                    .all(|ch| matches!(ch, 'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm'))
+            {
+                patterns.insert("I".to_string());
+                continue;
+            }
+        }
+    }
+
+    if patterns.is_empty() {
+        patterns.insert("none".to_string());
+    }
+
+    patterns.into_iter().collect()
 }
 
 fn build_openai_client(config: &LlmConfig) -> Result<openai::CompletionsClient> {
@@ -1258,10 +1420,12 @@ mod tests {
 
     use super::{
         LlmConfig, ObservedPrintedPageLabel, OutputWindow, RenderedPage, TocDirectionHint,
-        TocStructureExtraction, TocStructureLevel, VisionRequestConfig, batch_page_range_label,
-        bind_page_label_observations, build_openai_client, build_toc_extraction_instruction,
-        display_width, identify_toc_pages, merge_toc_structure_extractions, take_prefix_width,
-        take_suffix_width,
+        TocStructureExtraction, TocStructureGuide, TocStructureGuideLevel, TocStructureLevel,
+        VisionRequestConfig, batch_page_range_label, bind_page_label_observations,
+        build_fallback_toc_structure_guide, build_openai_client,
+        build_toc_extraction_instruction, display_width, guide_covers_structure,
+        identify_toc_pages, merge_toc_structure_extractions, take_prefix_width,
+        take_suffix_width, toc_structure_guide_is_reliable,
     };
     use crate::config::{CliArgs, resolve_args};
     use crate::pdf_support::PdfWorkspace;
@@ -1517,19 +1681,86 @@ mod tests {
     }
 
     #[test]
-    fn toc_extraction_instruction_embeds_structure_guide() {
-        let instruction = build_toc_extraction_instruction(Some(&TocStructureExtraction {
+    fn fallback_guide_preserves_structure_levels() {
+        let structure = TocStructureExtraction {
+            toc_found: true,
+            notes: Some("merged".to_string()),
+            levels: vec![
+                TocStructureLevel {
+                    level: 1,
+                    description: "Chapter level".to_string(),
+                    examples: vec!["Chapter 1".to_string()],
+                },
+                TocStructureLevel {
+                    level: 2,
+                    description: "Section level".to_string(),
+                    examples: vec!["1.1 Intro".to_string()],
+                },
+            ],
+        };
+
+        let guide = build_fallback_toc_structure_guide(&structure);
+
+        assert!(guide.toc_found);
+        assert_eq!(guide.levels.len(), 2);
+        assert_eq!(guide.levels[0].parent_level, None);
+        assert_eq!(guide.levels[1].parent_level, Some(1));
+        assert!(guide_covers_structure(&structure, &guide));
+        assert!(toc_structure_guide_is_reliable(&structure, &guide));
+    }
+
+    #[test]
+    fn unreliable_guide_is_rejected_when_it_drops_levels() {
+        let structure = TocStructureExtraction {
             toc_found: true,
             notes: None,
-            levels: vec![TocStructureLevel {
+            levels: vec![
+                TocStructureLevel {
+                    level: 1,
+                    description: "Chapter level".to_string(),
+                    examples: vec!["Chapter 1".to_string()],
+                },
+                TocStructureLevel {
+                    level: 2,
+                    description: "Section level".to_string(),
+                    examples: vec!["1.1 Intro".to_string()],
+                },
+            ],
+        };
+        let guide = TocStructureGuide {
+            toc_found: true,
+            notes: None,
+            levels: vec![TocStructureGuideLevel {
                 level: 1,
+                parent_level: None,
                 description: "Chapter level".to_string(),
+                numbering_patterns: vec!["Chapter N".to_string()],
                 examples: vec!["Chapter 1".to_string()],
+                notes: None,
+            }],
+        };
+
+        assert!(!guide_covers_structure(&structure, &guide));
+        assert!(!toc_structure_guide_is_reliable(&structure, &guide));
+    }
+
+    #[test]
+    fn toc_extraction_instruction_embeds_final_structure_guide() {
+        let instruction = build_toc_extraction_instruction(Some(&TocStructureGuide {
+            toc_found: true,
+            notes: None,
+            levels: vec![TocStructureGuideLevel {
+                level: 1,
+                parent_level: None,
+                description: "Chapter level".to_string(),
+                numbering_patterns: vec!["Chapter N".to_string()],
+                examples: vec!["Chapter 1".to_string()],
+                notes: None,
             }],
         }))
         .expect("instruction should build");
 
-        assert!(instruction.contains("GLOBAL TOC STRUCTURE JSON"));
+        assert!(instruction.contains("FINAL TOC STRUCTURE GUIDE JSON"));
         assert!(instruction.contains("Chapter level"));
         assert!(instruction.contains("Chapter 1"));
     }

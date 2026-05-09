@@ -19,13 +19,13 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 use crate::{
     config::{AppArgs, CliArgs, resolve_args},
     llm::{
-        LlmCall, LlmConfig, TocPageAssessmentBatch, VisionRequestConfig, extract_toc,
-        extract_toc_structure, identify_toc_pages, infer_toc_from_page_text,
-        observe_page_labels, organize_toc_hierarchy,
+        LlmCall, LlmConfig, TocPageAssessmentBatch, VisionRequestConfig,
+        build_fallback_toc_structure_guide, extract_toc, extract_toc_structure,
+        guide_covers_structure, identify_toc_pages, infer_toc_from_page_text, observe_page_labels,
+        organize_toc_structure, toc_structure_guide_is_reliable,
     },
     model::{
-        OutlineEntry, PageRange, RunOutcome, TocCandidateEntry, normalize_outline_for_compare,
-        normalize_toc_entries,
+        OutlineEntry, PageRange, RunOutcome, normalize_outline_for_compare, normalize_toc_entries,
     },
     pdf_support::{PdfWorkspace, is_toc_hit},
     progress::{
@@ -287,6 +287,59 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     set_run_status(
         &run_span,
         &args.input,
+        "organizing TOC structure",
+        &agent_progress.usage,
+        agent_progress.calls,
+    );
+    let guide_span = start_spinner("organize_toc_structure", "organizing TOC structure");
+    let guide_message = format!(
+        "organizing TOC structure from {} levels",
+        extracted_structure.levels.len()
+    );
+    let fallback_guide = build_fallback_toc_structure_guide(&extracted_structure);
+    let LlmCall {
+        data: organized_guide,
+        usage,
+        calls,
+    } = organize_toc_structure(
+        &llm_config,
+        &extracted_structure,
+        Some(&guide_span),
+        &guide_message,
+    )
+    .instrument(guide_span.clone())
+    .await?;
+    agent_progress.record(usage, calls);
+    let structure_guide = if toc_structure_guide_is_reliable(&extracted_structure, &organized_guide)
+    {
+        organized_guide
+    } else {
+        tracing::warn!(
+            raw_level_count = extracted_structure.levels.len(),
+            organized_level_count = organized_guide.levels.len(),
+            guide_covers_structure = guide_covers_structure(&extracted_structure, &organized_guide),
+            "organized TOC structure guide was unreliable; falling back to merged structure"
+        );
+        fallback_guide
+    };
+    tracing::info!(
+        toc_found = structure_guide.toc_found,
+        level_count = structure_guide.levels.len(),
+        usage_total_tokens = usage.total_tokens,
+        "TOC structure organized"
+    );
+    drop(guide_span);
+    finish_stage(
+        &run_span,
+        &args.input,
+        "TOC structure organized",
+        &agent_progress.usage,
+        agent_progress.calls,
+    );
+
+    set_run_status(
+        &run_span,
+        &args.input,
         "extracting TOC",
         &agent_progress.usage,
         agent_progress.calls,
@@ -310,7 +363,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         &llm_config,
         vision_request_config,
         &rendered_toc_pages,
-        Some(&extracted_structure),
+        Some(&structure_guide),
         Some(&extract_span),
         &extract_message,
     )
@@ -334,51 +387,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         agent_progress.calls,
     );
     let toc_heading_page = workspace.toc_heading_page(&extracted);
-    set_run_status(
-        &run_span,
-        &args.input,
-        "organizing TOC hierarchy",
-        &agent_progress.usage,
-        agent_progress.calls,
-    );
-    let organize_span = start_spinner("organize_toc_hierarchy", "organizing TOC hierarchy");
-    let organize_message = format!(
-        "organizing TOC hierarchy from {} extracted entries",
-        extracted.entries.len()
-    );
-    let reorganized_entries = if extracted.entries.is_empty() {
-        Vec::new()
-    } else {
-        let LlmCall {
-            data: organized,
-            usage,
-            calls,
-        } = organize_toc_hierarchy(
-            &llm_config,
-            &extracted.entries,
-            Some(&organize_span),
-            &organize_message,
-        )
-        .instrument(organize_span.clone())
-        .await?;
-        agent_progress.record(usage, calls);
-        reconcile_toc_hierarchy_entries(&extracted.entries, organized.entries)
-    };
-    tracing::info!(
-        extracted_entry_count = extracted.entries.len(),
-        reorganized_entry_count = reorganized_entries.len(),
-        toc_heading_page = ?toc_heading_page,
-        "TOC hierarchy organized"
-    );
-    drop(organize_span);
-    finish_stage(
-        &run_span,
-        &args.input,
-        "TOC hierarchy organized",
-        &agent_progress.usage,
-        agent_progress.calls,
-    );
-    let toc_entries = normalize_toc_entries(reorganized_entries);
+    let toc_entries = normalize_toc_entries(extracted.entries.clone());
     tracing::info!(
         normalized_entry_count = toc_entries.len(),
         toc_heading_page = ?toc_heading_page,
@@ -1099,46 +1108,10 @@ fn same_path(left: &Path, right: &Path) -> bool {
 
 fn stage_count_for(args: &AppArgs) -> u64 {
     if args.toc.is_some_and(|spec| spec.is_fully_bounded()) {
-        10
+        11
     } else {
-        12
+        13
     }
-}
-
-fn reconcile_toc_hierarchy_entries(
-    original_entries: &[TocCandidateEntry],
-    reorganized_entries: Vec<TocCandidateEntry>,
-) -> Vec<TocCandidateEntry> {
-    if reorganized_entries.len() != original_entries.len() {
-        tracing::warn!(
-            original_entries = original_entries.len(),
-            reorganized_entries = reorganized_entries.len(),
-            "organized TOC entry count changed; falling back to original extraction"
-        );
-        return original_entries.to_vec();
-    }
-
-    let mut reconciled = Vec::with_capacity(original_entries.len());
-    for (original, reorganized) in original_entries.iter().zip(reorganized_entries) {
-        if original.title != reorganized.title || original.page != reorganized.page {
-            tracing::warn!(
-                original_title = %original.title,
-                reorganized_title = %reorganized.title,
-                original_page = %original.page,
-                reorganized_page = %reorganized.page,
-                "organized TOC entry changed title or page; falling back to original extraction"
-            );
-            return original_entries.to_vec();
-        }
-
-        reconciled.push(TocCandidateEntry {
-            title: original.title.clone(),
-            page: original.page.clone(),
-            level: reorganized.level.max(1),
-        });
-    }
-
-    reconciled
 }
 
 fn ensure_toc_heading_entry(
@@ -1182,11 +1155,11 @@ fn is_toc_heading_title(title: &str) -> bool {
 mod tests {
     use super::{
         ensure_toc_heading_entry, format_rendered_page_range, is_toc_heading_title,
-        reconcile_toc_hierarchy_entries, stage_count_for,
+        stage_count_for,
     };
     use crate::{
         config::AppArgs,
-        model::{OutlineEntry, PageRangeSpec, RenderedPage, TocCandidateEntry},
+        model::{OutlineEntry, PageRangeSpec, RenderedPage},
     };
     use std::path::PathBuf;
 
@@ -1254,59 +1227,7 @@ mod tests {
             vision_workers: 4,
             external_process_concurrency: 4,
         };
-        assert_eq!(stage_count_for(&args), 10);
-    }
-
-    #[test]
-    fn reconcile_toc_hierarchy_rejects_title_changes() {
-        let original = vec![TocCandidateEntry {
-            title: "1.1 HDL".to_string(),
-            level: 1,
-            page: "20".to_string(),
-        }];
-        let reorganized = vec![TocCandidateEntry {
-            title: "1.1 Verilog HDL".to_string(),
-            level: 2,
-            page: "20".to_string(),
-        }];
-
-        let reconciled = reconcile_toc_hierarchy_entries(&original, reorganized);
-        assert_eq!(reconciled.len(), 1);
-        assert_eq!(reconciled[0].title, original[0].title);
-        assert_eq!(reconciled[0].page, original[0].page);
-        assert_eq!(reconciled[0].level, original[0].level);
-    }
-
-    #[test]
-    fn reconcile_toc_hierarchy_keeps_only_level_changes() {
-        let original = vec![
-            TocCandidateEntry {
-                title: "1.2 Verilog HDL 的历史".to_string(),
-                level: 1,
-                page: "21".to_string(),
-            },
-            TocCandidateEntry {
-                title: "1.2.1 什么是 Verilog HDL".to_string(),
-                level: 1,
-                page: "21".to_string(),
-            },
-        ];
-        let reorganized = vec![
-            TocCandidateEntry {
-                title: "1.2 Verilog HDL 的历史".to_string(),
-                level: 1,
-                page: "21".to_string(),
-            },
-            TocCandidateEntry {
-                title: "1.2.1 什么是 Verilog HDL".to_string(),
-                level: 2,
-                page: "21".to_string(),
-            },
-        ];
-
-        let reconciled = reconcile_toc_hierarchy_entries(&original, reorganized);
-        assert_eq!(reconciled[0].level, 1);
-        assert_eq!(reconciled[1].level, 2);
+        assert_eq!(stage_count_for(&args), 11);
     }
 
     #[test]
