@@ -1,3 +1,9 @@
 model = "gpt-4o-mini"
 api_base = "https://api.openai.com/v1"
 api_key = "sk-..."
+
+vision_worker_batch_size = 1 # 建议设置成 1, 大于 1 的值可能导致模型吞页.
+vision_workers = 4
+
+# 可选配置参数, 如果不设置, 默认为 CPU 核数.
+external_process_concurrency = 8
