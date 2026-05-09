@@ -48,6 +48,22 @@ Rules:
 - Ignore running headers, footers, and body text that is not part of the table of contents.
 "#;
 
+const TOC_STRUCTURE_PREAMBLE: &str = r#"
+You inspect PDF table-of-contents pages and extract only their hierarchy structure.
+
+Rules:
+- Decide whether the provided pages contain a real table of contents.
+- If there is no real table of contents, return toc_found = false, levels = [], and notes explaining why when useful.
+- Extract every distinct hierarchy level that is actually evidenced in the provided TOC pages.
+- Do not list every TOC item.
+- Represent each distinct level at most once per batch.
+- Use level = 1 for top-level TOC entries.
+- Use the field `description` to summarize the cues that distinguish this level, such as numbering style, wording, indentation, or visual grouping.
+- Use the field `examples` for a few short representative titles copied exactly from the page.
+- Keep examples in reading order and return at most 3 examples per level.
+- Do not invent hidden parents, missing entries, or unsupported levels.
+"#;
+
 const TOC_HIERARCHY_PREAMBLE: &str = r#"
 You reorganize the hierarchy levels of an already extracted PDF table of contents.
 
@@ -166,6 +182,26 @@ pub struct TocHierarchyOrganization {
     pub notes: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct TocStructureLevel {
+    #[schemars(required)]
+    pub level: u8,
+    #[schemars(required)]
+    pub description: String,
+    #[schemars(required)]
+    pub examples: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct TocStructureExtraction {
+    #[schemars(required)]
+    pub toc_found: bool,
+    #[schemars(required)]
+    pub notes: Option<String>,
+    #[schemars(required)]
+    pub levels: Vec<TocStructureLevel>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VisionPageObservation {
     #[schemars(required)]
@@ -244,11 +280,40 @@ pub async fn extract_toc(
     config: &LlmConfig,
     request_config: VisionRequestConfig,
     pages: &[RenderedPage],
+    structure: Option<&TocStructureExtraction>,
     progress_span: Option<&Span>,
     progress_label: &str,
 ) -> Result<LlmCall<TocExtraction>> {
     if pages.is_empty() {
         bail!("no candidate pages were provided to the LLM extractor");
+    }
+
+    let instruction = Arc::<str>::from(build_toc_extraction_instruction(structure)?);
+    let batches = chunk_rendered_pages(pages, request_config.batch_size);
+    stream_batched_structured_output(
+        config,
+        request_config,
+        batches,
+        move |batch_pages| {
+            build_multimodal_message(batch_pages, instruction.as_ref())
+        },
+        merge_toc_extractions,
+        EXTRACTION_PREAMBLE,
+        progress_span,
+        progress_label,
+    )
+    .await
+}
+
+pub async fn extract_toc_structure(
+    config: &LlmConfig,
+    request_config: VisionRequestConfig,
+    pages: &[RenderedPage],
+    progress_span: Option<&Span>,
+    progress_label: &str,
+) -> Result<LlmCall<TocStructureExtraction>> {
+    if pages.is_empty() {
+        bail!("no candidate pages were provided to the TOC structure extractor");
     }
 
     let batches = chunk_rendered_pages(pages, request_config.batch_size);
@@ -259,11 +324,11 @@ pub async fn extract_toc(
         |batch_pages| {
             build_multimodal_message(
                 batch_pages,
-                "Determine whether these PDF pages contain a table of contents, then extract it.",
+                "Determine whether these PDF pages contain a table of contents, then extract only the hierarchy structure.",
             )
         },
-        merge_toc_extractions,
-        EXTRACTION_PREAMBLE,
+        merge_toc_structure_extractions,
+        TOC_STRUCTURE_PREAMBLE,
         progress_span,
         progress_label,
     )
@@ -430,6 +495,77 @@ fn merge_toc_extractions(mut batches: Vec<TocExtraction>) -> Result<TocExtractio
     })
 }
 
+fn merge_toc_structure_extractions(
+    mut batches: Vec<TocStructureExtraction>,
+) -> Result<TocStructureExtraction> {
+    if batches.is_empty() {
+        bail!("no TOC structure batches were returned");
+    }
+
+    let mut notes = Vec::new();
+    let mut levels: Vec<TocStructureLevel> = Vec::new();
+    let mut toc_found = false;
+
+    for batch in batches.drain(..) {
+        toc_found |= batch.toc_found;
+        if let Some(note) = batch.notes {
+            let trimmed = note.trim();
+            if !trimmed.is_empty() {
+                notes.push(trimmed.to_string());
+            }
+        }
+
+        for mut level in batch.levels {
+            level.level = level.level.max(1);
+            level.description = collapse_inline_whitespace(&level.description);
+            level.examples = level
+                .examples
+                .into_iter()
+                .map(|example| collapse_inline_whitespace(&example))
+                .filter(|example| !example.is_empty())
+                .take(3)
+                .collect();
+
+            if level.description.is_empty() {
+                continue;
+            }
+
+            if let Some(existing) = levels.iter_mut().find(|existing| {
+                existing.level == level.level
+                    && normalize_structure_description(&existing.description)
+                        == normalize_structure_description(&level.description)
+            }) {
+                for example in level.examples {
+                    if !existing.examples.iter().any(|current| current == &example) {
+                        existing.examples.push(example);
+                    }
+                    if existing.examples.len() >= 4 {
+                        break;
+                    }
+                }
+            } else {
+                levels.push(level);
+            }
+        }
+    }
+
+    if !toc_found {
+        levels.clear();
+    }
+
+    levels.sort_by(|left, right| {
+        left.level
+            .cmp(&right.level)
+            .then_with(|| left.description.cmp(&right.description))
+    });
+
+    Ok(TocStructureExtraction {
+        toc_found,
+        notes: (!notes.is_empty()).then(|| notes.join("\n")),
+        levels,
+    })
+}
+
 fn merge_vision_observation_batches(
     mut batches: Vec<VisionPageObservationBatch>,
 ) -> Result<VisionPageObservationBatch> {
@@ -493,6 +629,29 @@ fn build_multimodal_message(pages: &[RenderedPage], instruction: &str) -> Result
     })
 }
 
+fn build_toc_extraction_instruction(
+    structure: Option<&TocStructureExtraction>,
+) -> Result<String> {
+    let mut instruction =
+        "Determine whether these PDF pages contain a table of contents, then extract it."
+            .to_string();
+
+    let Some(structure) = structure
+        .filter(|structure| structure.toc_found && !structure.levels.is_empty())
+    else {
+        return Ok(instruction);
+    };
+
+    let serialized = serde_json::to_string_pretty(structure)
+        .context("failed to serialize TOC structure guide for extraction")?;
+    instruction.push_str(
+        "\n\nUse this precomputed global TOC structure guide when assigning the `level` field. The guide is aggregated across all TOC page batches, so it may mention parent or sibling levels that are not visible in this specific batch. Use it as a prior only when it matches the visible page.\n\n---BEGIN GLOBAL TOC STRUCTURE JSON---\n",
+    );
+    instruction.push_str(&serialized);
+    instruction.push_str("\n---END GLOBAL TOC STRUCTURE JSON---");
+    Ok(instruction)
+}
+
 fn build_text_page_message(pages: &[ExtractedPageText], instruction: &str) -> Result<Message> {
     let mut content = Vec::with_capacity(1 + pages.len());
     content.push(UserContent::text(instruction));
@@ -507,6 +666,14 @@ fn build_text_page_message(pages: &[ExtractedPageText], instruction: &str) -> Re
     Ok(Message::User {
         content: OneOrMany::many(content).context("text prompt cannot be empty")?,
     })
+}
+
+fn collapse_inline_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_structure_description(value: &str) -> String {
+    collapse_inline_whitespace(value).to_ascii_lowercase()
 }
 
 fn build_toc_hierarchy_message(
@@ -661,7 +828,7 @@ async fn stream_batched_structured_output<T, FBuild, FMerge>(
 ) -> Result<LlmCall<T>>
 where
     T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
-    FBuild: Fn(&[RenderedPage]) -> Result<Message> + Copy + Send + Sync + 'static,
+    FBuild: Fn(&[RenderedPage]) -> Result<Message> + Clone + Send + Sync + 'static,
     FMerge: Fn(Vec<T>) -> Result<T> + Copy + Send + Sync + 'static,
 {
     if batches.is_empty() {
@@ -702,6 +869,7 @@ where
         );
         let config = config.clone();
         let preamble = preamble.clone();
+        let build_prompt = build_prompt.clone();
         let queue = Arc::clone(&queue);
         let completed_batches = Arc::clone(&completed_batches);
         let completed_pages = Arc::clone(&completed_pages);
@@ -786,7 +954,7 @@ async fn run_batched_worker<T, FBuild>(
 ) -> Result<Vec<BatchResult<T>>>
 where
     T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
-    FBuild: Fn(&[RenderedPage]) -> Result<Message> + Copy + Send + Sync + 'static,
+    FBuild: Fn(&[RenderedPage]) -> Result<Message> + Send + Sync + 'static,
 {
     let mut results = Vec::new();
 
@@ -1090,8 +1258,9 @@ mod tests {
 
     use super::{
         LlmConfig, ObservedPrintedPageLabel, OutputWindow, RenderedPage, TocDirectionHint,
-        VisionRequestConfig, batch_page_range_label, bind_page_label_observations,
-        build_openai_client, display_width, identify_toc_pages, take_prefix_width,
+        TocStructureExtraction, TocStructureLevel, VisionRequestConfig, batch_page_range_label,
+        bind_page_label_observations, build_openai_client, build_toc_extraction_instruction,
+        display_width, identify_toc_pages, merge_toc_structure_extractions, take_prefix_width,
         take_suffix_width,
     };
     use crate::config::{CliArgs, resolve_args};
@@ -1306,6 +1475,63 @@ mod tests {
         assert_eq!(bound[0].printed_page_label.as_deref(), Some("1"));
         assert_eq!(bound[1].physical_page, 15);
         assert_eq!(bound[1].printed_page_label.as_deref(), Some("4"));
+    }
+
+    #[test]
+    fn merge_toc_structure_extractions_deduplicates_level_descriptions() {
+        let merged = merge_toc_structure_extractions(vec![
+            TocStructureExtraction {
+                toc_found: true,
+                notes: Some("batch 1".to_string()),
+                levels: vec![TocStructureLevel {
+                    level: 1,
+                    description: "Chapter level".to_string(),
+                    examples: vec!["Chapter 1".to_string()],
+                }],
+            },
+            TocStructureExtraction {
+                toc_found: true,
+                notes: Some("batch 2".to_string()),
+                levels: vec![
+                    TocStructureLevel {
+                        level: 1,
+                        description: "chapter   level".to_string(),
+                        examples: vec!["Chapter 2".to_string()],
+                    },
+                    TocStructureLevel {
+                        level: 2,
+                        description: "Section level".to_string(),
+                        examples: vec!["1.1 Intro".to_string()],
+                    },
+                ],
+            },
+        ])
+        .expect("structure batches should merge");
+
+        assert!(merged.toc_found);
+        assert_eq!(merged.levels.len(), 2);
+        assert_eq!(merged.levels[0].level, 1);
+        assert_eq!(merged.levels[0].examples, vec!["Chapter 1", "Chapter 2"]);
+        assert_eq!(merged.levels[1].level, 2);
+        assert_eq!(merged.notes.as_deref(), Some("batch 1\nbatch 2"));
+    }
+
+    #[test]
+    fn toc_extraction_instruction_embeds_structure_guide() {
+        let instruction = build_toc_extraction_instruction(Some(&TocStructureExtraction {
+            toc_found: true,
+            notes: None,
+            levels: vec![TocStructureLevel {
+                level: 1,
+                description: "Chapter level".to_string(),
+                examples: vec!["Chapter 1".to_string()],
+            }],
+        }))
+        .expect("instruction should build");
+
+        assert!(instruction.contains("GLOBAL TOC STRUCTURE JSON"));
+        assert!(instruction.contains("Chapter level"));
+        assert!(instruction.contains("Chapter 1"));
     }
 
     #[test]

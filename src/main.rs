@@ -20,7 +20,8 @@ use crate::{
     config::{AppArgs, CliArgs, resolve_args},
     llm::{
         LlmCall, LlmConfig, TocPageAssessmentBatch, VisionRequestConfig, extract_toc,
-        identify_toc_pages, infer_toc_from_page_text, observe_page_labels, organize_toc_hierarchy,
+        extract_toc_structure, identify_toc_pages, infer_toc_from_page_text,
+        observe_page_labels, organize_toc_hierarchy,
     },
     model::{
         OutlineEntry, PageRange, RunOutcome, TocCandidateEntry, normalize_outline_for_compare,
@@ -239,6 +240,53 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
     set_run_status(
         &run_span,
         &args.input,
+        "extracting TOC structure",
+        &agent_progress.usage,
+        agent_progress.calls,
+    );
+    let structure_span = start_spinner(
+        "extract_toc_structure",
+        format!(
+            "extracting TOC structure from {}",
+            format_rendered_page_range(&rendered_toc_pages)
+        ),
+    );
+    let structure_message = format!(
+        "extracting TOC structure from {}",
+        format_rendered_page_range(&rendered_toc_pages)
+    );
+    let LlmCall {
+        data: extracted_structure,
+        usage,
+        calls,
+    } = extract_toc_structure(
+        &llm_config,
+        vision_request_config,
+        &rendered_toc_pages,
+        Some(&structure_span),
+        &structure_message,
+    )
+    .instrument(structure_span.clone())
+    .await?;
+    agent_progress.record(usage, calls);
+    tracing::info!(
+        toc_found = extracted_structure.toc_found,
+        level_count = extracted_structure.levels.len(),
+        usage_total_tokens = usage.total_tokens,
+        "TOC structure extracted"
+    );
+    drop(structure_span);
+    finish_stage(
+        &run_span,
+        &args.input,
+        "TOC structure ready",
+        &agent_progress.usage,
+        agent_progress.calls,
+    );
+
+    set_run_status(
+        &run_span,
+        &args.input,
         "extracting TOC",
         &agent_progress.usage,
         agent_progress.calls,
@@ -262,6 +310,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         &llm_config,
         vision_request_config,
         &rendered_toc_pages,
+        Some(&extracted_structure),
         Some(&extract_span),
         &extract_message,
     )
@@ -1050,9 +1099,9 @@ fn same_path(left: &Path, right: &Path) -> bool {
 
 fn stage_count_for(args: &AppArgs) -> u64 {
     if args.toc.is_some_and(|spec| spec.is_fully_bounded()) {
-        9
+        10
     } else {
-        11
+        12
     }
 }
 
@@ -1205,7 +1254,7 @@ mod tests {
             vision_workers: 4,
             external_process_concurrency: 4,
         };
-        assert_eq!(stage_count_for(&args), 9);
+        assert_eq!(stage_count_for(&args), 10);
     }
 
     #[test]
