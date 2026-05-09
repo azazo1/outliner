@@ -1309,19 +1309,21 @@ fn record_rendered_page_stage(
     pages: &[RenderedPage],
     usage: &Usage,
 ) -> Result<()> {
-    if !trace_recorder.is_enabled() {
+    let Some(stage_slot) = trace_recorder.reserve_stage_slot(stage_name)? else {
         return Ok(());
-    }
+    };
 
     let mut artifact_refs = Vec::new();
     for page in pages {
-        if let Some(artifact_ref) =
-            trace_recorder.record_binary_artifact("rendered_page_png", "png", &page.png_bytes)?
-        {
+        if let Some(artifact_ref) = stage_slot.artifacts().record_binary_artifact(
+            "rendered_page_png",
+            "png",
+            &page.png_bytes,
+        )? {
             artifact_refs.push(artifact_ref);
         }
     }
-    trace_recorder.record_stage(DebugTraceStageRecord {
+    stage_slot.finish(DebugTraceStageRecord {
         stage_name: stage_name.to_string(),
         page_range: Some(format_rendered_page_range(pages)),
         worker: None,
@@ -1337,17 +1339,18 @@ fn record_text_stage(
     pages: &[ExtractedPageText],
     usage: &Usage,
 ) -> Result<()> {
-    if !trace_recorder.is_enabled() {
+    let Some(stage_slot) = trace_recorder.reserve_stage_slot(stage_name)? else {
         return Ok(());
-    }
+    };
 
     let mut artifact_refs = Vec::new();
-    if let Some(artifact_ref) =
-        trace_recorder.record_text_artifact(stage_name, &summarize_extracted_pages(pages))?
+    if let Some(artifact_ref) = stage_slot
+        .artifacts()
+        .record_text_artifact(stage_name, &summarize_extracted_pages(pages))?
     {
         artifact_refs.push(artifact_ref);
     }
-    trace_recorder.record_stage(DebugTraceStageRecord {
+    stage_slot.finish(DebugTraceStageRecord {
         stage_name: stage_name.to_string(),
         page_range: page_range_from_numbers(
             &pages
@@ -1367,17 +1370,18 @@ fn record_toc_evidence_stage(
     evidence_pages: &[TocPageEvidence],
     usage: &Usage,
 ) -> Result<()> {
-    if !trace_recorder.is_enabled() {
+    let Some(stage_slot) = trace_recorder.reserve_stage_slot("collect_toc_page_evidence")? else {
         return Ok(());
-    }
+    };
 
     let mut artifact_refs = Vec::new();
-    if let Some(artifact_ref) = trace_recorder
+    if let Some(artifact_ref) = stage_slot
+        .artifacts()
         .record_text_artifact("toc_page_evidence", &summarize_toc_evidence(evidence_pages))?
     {
         artifact_refs.push(artifact_ref);
     }
-    trace_recorder.record_stage(DebugTraceStageRecord {
+    stage_slot.finish(DebugTraceStageRecord {
         stage_name: "collect_toc_page_evidence".to_string(),
         page_range: page_range_from_numbers(
             &evidence_pages
@@ -1398,15 +1402,18 @@ fn record_toc_markdown_stage(
     pages: &[TocPageMarkdown],
     usage: &Usage,
 ) -> Result<()> {
-    if !trace_recorder.is_enabled() {
+    let Some(stage_slot) = trace_recorder.reserve_stage_slot(stage_name)? else {
         return Ok(());
-    }
+    };
 
     let mut artifact_refs = Vec::new();
-    if let Some(artifact_ref) = trace_recorder.record_json_artifact(stage_name, &pages)? {
+    if let Some(artifact_ref) = stage_slot
+        .artifacts()
+        .record_json_artifact(stage_name, &pages)?
+    {
         artifact_refs.push(artifact_ref);
     }
-    trace_recorder.record_stage(DebugTraceStageRecord {
+    stage_slot.finish(DebugTraceStageRecord {
         stage_name: stage_name.to_string(),
         page_range: page_range_from_numbers(
             &pages
@@ -1426,17 +1433,18 @@ fn record_toc_markdown_document_stage(
     document: &TocMarkdownDocument,
     usage: &Usage,
 ) -> Result<()> {
-    if !trace_recorder.is_enabled() {
+    let Some(stage_slot) = trace_recorder.reserve_stage_slot("assemble_toc_markdown")? else {
         return Ok(());
-    }
+    };
 
     let mut artifact_refs = Vec::new();
-    if let Some(artifact_ref) =
-        trace_recorder.record_text_artifact("toc_markdown_document", &document.combined_markdown)?
+    if let Some(artifact_ref) = stage_slot
+        .artifacts()
+        .record_text_artifact("toc_markdown_document", &document.combined_markdown)?
     {
         artifact_refs.push(artifact_ref);
     }
-    trace_recorder.record_stage(DebugTraceStageRecord {
+    stage_slot.finish(DebugTraceStageRecord {
         stage_name: "assemble_toc_markdown".to_string(),
         page_range: page_range_from_numbers(
             &document
@@ -1457,17 +1465,18 @@ fn record_page_label_stage(
     observations: &[VisionPageObservation],
     usage: &Usage,
 ) -> Result<()> {
-    if !trace_recorder.is_enabled() {
+    let Some(stage_slot) = trace_recorder.reserve_stage_slot("observe_page_labels")? else {
         return Ok(());
-    }
+    };
 
     let mut artifact_refs = Vec::new();
-    if let Some(artifact_ref) =
-        trace_recorder.record_json_artifact("page_label_observations", &observations)?
+    if let Some(artifact_ref) = stage_slot
+        .artifacts()
+        .record_json_artifact("page_label_observations", &observations)?
     {
         artifact_refs.push(artifact_ref);
     }
-    trace_recorder.record_stage(DebugTraceStageRecord {
+    stage_slot.finish(DebugTraceStageRecord {
         stage_name: "observe_page_labels".to_string(),
         page_range: page_range_from_numbers(
             &observations
@@ -1488,22 +1497,24 @@ fn record_visual_review_stage(
     results: &[crate::model::VisualReviewResult],
     usage: &Usage,
 ) -> Result<()> {
-    if !trace_recorder.is_enabled() {
+    let Some(stage_slot) = trace_recorder.reserve_stage_slot("review_toc_visual_gaps")? else {
         return Ok(());
-    }
+    };
 
     let mut artifact_refs = Vec::new();
-    if let Some(artifact_ref) =
-        trace_recorder.record_json_artifact("toc_review_requests", &requests)?
+    if let Some(artifact_ref) = stage_slot
+        .artifacts()
+        .record_json_artifact("toc_review_requests", &requests)?
     {
         artifact_refs.push(artifact_ref);
     }
-    if let Some(artifact_ref) =
-        trace_recorder.record_json_artifact("toc_review_results", &results)?
+    if let Some(artifact_ref) = stage_slot
+        .artifacts()
+        .record_json_artifact("toc_review_results", &results)?
     {
         artifact_refs.push(artifact_ref);
     }
-    trace_recorder.record_stage(DebugTraceStageRecord {
+    stage_slot.finish(DebugTraceStageRecord {
         stage_name: "review_toc_visual_gaps".to_string(),
         page_range: page_range_from_numbers(
             &requests

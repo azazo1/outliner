@@ -28,7 +28,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::progress::{set_spinner_message, start_spinner};
 use crate::{
-    debug_trace::DebugTraceRecorder,
+    debug_trace::{DebugTraceArtifactScope, DebugTraceRecorder},
     model::{
         DebugTraceLlmCallRecord, DebugTraceLlmOutputRecord, DebugTraceMessagePartRecord,
         DebugTraceMessageRecord, DebugTraceUsageSnapshot, ExtractedPageText, RenderedPage,
@@ -1432,27 +1432,32 @@ fn record_llm_call_trace(
     trace: &StructuredOutputTrace,
     usage: &Usage,
 ) -> Result<()> {
-    let raw_output_ref = recorder.record_text_artifact("llm_raw_output", &trace.raw_output)?;
+    let Some(call_slot) = recorder.reserve_llm_call_slot(stage_name)? else {
+        return Ok(());
+    };
+    let artifacts = call_slot.artifacts().clone();
+
+    let raw_output_ref = artifacts.record_text_artifact("llm_raw_output", &trace.raw_output)?;
     let repaired_output_ref = trace
         .repaired_output
         .as_ref()
-        .map(|text| recorder.record_text_artifact("llm_repaired_output", text))
+        .map(|text| artifacts.record_text_artifact("llm_repaired_output", text))
         .transpose()?
         .flatten();
     let structured_output_ref =
-        recorder.record_text_artifact("llm_structured_output", &trace.structured_output)?;
+        artifacts.record_text_artifact("llm_structured_output", &trace.structured_output)?;
 
     let mut messages = vec![DebugTraceMessageRecord {
         role: "system".to_string(),
         parts: vec![DebugTraceMessagePartRecord {
             kind: "text".to_string(),
-            artifact_ref: recorder.record_text_artifact("llm_system_message", preamble)?,
+            artifact_ref: artifacts.record_text_artifact("llm_system_message", preamble)?,
             text: None,
             media_type: None,
             detail: None,
         }],
     }];
-    messages.push(convert_message_for_trace(recorder, prompt)?);
+    messages.push(convert_message_for_trace(&artifacts, prompt)?);
     messages.push(DebugTraceMessageRecord {
         role: "assistant".to_string(),
         parts: vec![DebugTraceMessagePartRecord {
@@ -1470,7 +1475,7 @@ fn record_llm_call_trace(
         structured_output_ref,
     };
 
-    recorder.record_llm_call(DebugTraceLlmCallRecord {
+    call_slot.finish(DebugTraceLlmCallRecord {
         call_id: String::new(),
         stage_name: stage_name.to_string(),
         worker: worker.clone(),
@@ -1482,9 +1487,14 @@ fn record_llm_call_trace(
     })?;
 
     if let Some(repair_trace) = trace.repair_trace.as_ref() {
-        let repair_raw_output_ref =
-            recorder.record_text_artifact("llm_repair_raw_output", &repair_trace.raw_output)?;
-        let repair_structured_output_ref = recorder.record_text_artifact(
+        let repair_stage_name = format!("{stage_name}.repair");
+        let Some(repair_slot) = recorder.reserve_llm_call_slot(&repair_stage_name)? else {
+            return Ok(());
+        };
+        let repair_artifacts = repair_slot.artifacts().clone();
+        let repair_raw_output_ref = repair_artifacts
+            .record_text_artifact("llm_repair_raw_output", &repair_trace.raw_output)?;
+        let repair_structured_output_ref = repair_artifacts.record_text_artifact(
             "llm_repair_structured_output",
             &repair_trace.structured_output,
         )?;
@@ -1493,9 +1503,9 @@ fn record_llm_call_trace(
             repaired_output_ref: None,
             structured_output_ref: repair_structured_output_ref,
         };
-        recorder.record_llm_call(DebugTraceLlmCallRecord {
+        repair_slot.finish(DebugTraceLlmCallRecord {
             call_id: String::new(),
-            stage_name: format!("{stage_name}.repair"),
+            stage_name: repair_stage_name,
             worker: worker.clone(),
             page_range: page_range.clone(),
             messages: vec![
@@ -1503,7 +1513,7 @@ fn record_llm_call_trace(
                     role: "system".to_string(),
                     parts: vec![DebugTraceMessagePartRecord {
                         kind: "text".to_string(),
-                        artifact_ref: recorder.record_text_artifact(
+                        artifact_ref: repair_artifacts.record_text_artifact(
                             "llm_repair_system_message",
                             &repair_trace.preamble,
                         )?,
@@ -1512,7 +1522,7 @@ fn record_llm_call_trace(
                         detail: None,
                     }],
                 },
-                convert_message_for_trace(recorder, &repair_trace.prompt)?,
+                convert_message_for_trace(&repair_artifacts, &repair_trace.prompt)?,
                 DebugTraceMessageRecord {
                     role: "assistant".to_string(),
                     parts: vec![DebugTraceMessagePartRecord {
@@ -1534,7 +1544,7 @@ fn record_llm_call_trace(
 }
 
 fn convert_message_for_trace(
-    recorder: &DebugTraceRecorder,
+    artifacts: &DebugTraceArtifactScope,
     message: &Message,
 ) -> Result<DebugTraceMessageRecord> {
     match message {
@@ -1542,7 +1552,7 @@ fn convert_message_for_trace(
             role: "system".to_string(),
             parts: vec![DebugTraceMessagePartRecord {
                 kind: "text".to_string(),
-                artifact_ref: recorder.record_text_artifact("llm_message_text", content)?,
+                artifact_ref: artifacts.record_text_artifact("llm_message_text", content)?,
                 text: None,
                 media_type: None,
                 detail: None,
@@ -1552,32 +1562,32 @@ fn convert_message_for_trace(
             role: "user".to_string(),
             parts: content
                 .iter()
-                .map(|part| convert_user_content_for_trace(recorder, part))
+                .map(|part| convert_user_content_for_trace(artifacts, part))
                 .collect::<Result<Vec<_>>>()?,
         }),
         Message::Assistant { content, .. } => Ok(DebugTraceMessageRecord {
             role: "assistant".to_string(),
             parts: content
                 .iter()
-                .map(|part| convert_assistant_content_for_trace(recorder, part))
+                .map(|part| convert_assistant_content_for_trace(artifacts, part))
                 .collect::<Result<Vec<_>>>()?,
         }),
     }
 }
 
 fn convert_user_content_for_trace(
-    recorder: &DebugTraceRecorder,
+    artifacts: &DebugTraceArtifactScope,
     content: &UserContent,
 ) -> Result<DebugTraceMessagePartRecord> {
     match content {
         UserContent::Text(text) => Ok(DebugTraceMessagePartRecord {
             kind: "text".to_string(),
-            artifact_ref: recorder.record_text_artifact("llm_message_text", &text.text)?,
+            artifact_ref: artifacts.record_text_artifact("llm_message_text", &text.text)?,
             text: None,
             media_type: None,
             detail: None,
         }),
-        UserContent::Image(image) => convert_image_for_trace(recorder, image),
+        UserContent::Image(image) => convert_image_for_trace(artifacts, image),
         UserContent::Audio(_) => Ok(DebugTraceMessagePartRecord {
             kind: "audio".to_string(),
             artifact_ref: None,
@@ -1601,7 +1611,7 @@ fn convert_user_content_for_trace(
         }),
         UserContent::ToolResult(tool_result) => Ok(DebugTraceMessagePartRecord {
             kind: "tool_result".to_string(),
-            artifact_ref: recorder.record_json_artifact("llm_tool_result", tool_result)?,
+            artifact_ref: artifacts.record_json_artifact("llm_tool_result", tool_result)?,
             text: None,
             media_type: None,
             detail: None,
@@ -1610,28 +1620,28 @@ fn convert_user_content_for_trace(
 }
 
 fn convert_assistant_content_for_trace(
-    recorder: &DebugTraceRecorder,
+    artifacts: &DebugTraceArtifactScope,
     content: &AssistantContent,
 ) -> Result<DebugTraceMessagePartRecord> {
     match content {
         AssistantContent::Text(text) => Ok(DebugTraceMessagePartRecord {
             kind: "text".to_string(),
-            artifact_ref: recorder.record_text_artifact("llm_message_text", &text.text)?,
+            artifact_ref: artifacts.record_text_artifact("llm_message_text", &text.text)?,
             text: None,
             media_type: None,
             detail: None,
         }),
-        AssistantContent::Image(image) => convert_image_for_trace(recorder, image),
+        AssistantContent::Image(image) => convert_image_for_trace(artifacts, image),
         AssistantContent::ToolCall(tool_call) => Ok(DebugTraceMessagePartRecord {
             kind: "tool_call".to_string(),
-            artifact_ref: recorder.record_json_artifact("llm_tool_call", tool_call)?,
+            artifact_ref: artifacts.record_json_artifact("llm_tool_call", tool_call)?,
             text: None,
             media_type: None,
             detail: None,
         }),
         AssistantContent::Reasoning(reasoning) => Ok(DebugTraceMessagePartRecord {
             kind: "reasoning".to_string(),
-            artifact_ref: recorder.record_json_artifact("llm_reasoning", reasoning)?,
+            artifact_ref: artifacts.record_json_artifact("llm_reasoning", reasoning)?,
             text: None,
             media_type: None,
             detail: None,
@@ -1640,7 +1650,7 @@ fn convert_assistant_content_for_trace(
 }
 
 fn convert_image_for_trace(
-    recorder: &DebugTraceRecorder,
+    artifacts: &DebugTraceArtifactScope,
     image: &Image,
 ) -> Result<DebugTraceMessagePartRecord> {
     let artifact_ref = match &image.data {
@@ -1648,13 +1658,13 @@ fn convert_image_for_trace(
             let bytes = BASE64_STANDARD
                 .decode(data)
                 .context("failed to decode base64 image for trace")?;
-            recorder.record_binary_artifact("llm_message_image", "png", &bytes)?
+            artifacts.record_binary_artifact("llm_message_image", "png", &bytes)?
         }
         DocumentSourceKind::Raw(bytes) => {
-            recorder.record_binary_artifact("llm_message_image", "bin", bytes)?
+            artifacts.record_binary_artifact("llm_message_image", "bin", bytes)?
         }
         DocumentSourceKind::Url(url) | DocumentSourceKind::String(url) => {
-            recorder.record_text_artifact("llm_message_image_ref", url)?
+            artifacts.record_text_artifact("llm_message_image_ref", url)?
         }
         DocumentSourceKind::Unknown => None,
         _ => None,

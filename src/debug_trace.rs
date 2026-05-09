@@ -13,6 +13,25 @@ use crate::model::{
     DebugTraceStageRecord, RunOutcome,
 };
 
+#[derive(Debug, Clone)]
+pub struct DebugTraceArtifactScope {
+    inner: Arc<DebugTraceRecorderInner>,
+    artifact_prefix: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DebugTraceStageSlot {
+    artifacts: DebugTraceArtifactScope,
+    stage_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct DebugTraceLlmCallSlot {
+    artifacts: DebugTraceArtifactScope,
+    call_id: String,
+    call_path: PathBuf,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DebugTraceRecorder {
     inner: Option<Arc<DebugTraceRecorderInner>>,
@@ -67,85 +86,58 @@ impl DebugTraceRecorder {
         self.inner.is_some()
     }
 
-    pub fn record_text_artifact(&self, kind: &str, content: &str) -> Result<Option<String>> {
-        self.record_bytes_artifact(kind, "txt", content.as_bytes())
-    }
-
-    pub fn record_json_artifact<T>(&self, kind: &str, value: &T) -> Result<Option<String>>
-    where
-        T: Serialize,
-    {
-        let bytes = serde_json::to_vec_pretty(value)
-            .with_context(|| format!("failed to serialize trace artifact {kind}"))?;
-        self.record_bytes_artifact(kind, "json", &bytes)
-    }
-
-    pub fn record_binary_artifact(
-        &self,
-        kind: &str,
-        extension: &str,
-        bytes: &[u8],
-    ) -> Result<Option<String>> {
-        self.record_bytes_artifact(kind, extension, bytes)
-    }
-
-    pub fn record_stage(&self, record: DebugTraceStageRecord) -> Result<()> {
+    pub fn reserve_stage_slot(&self, stage_name: &str) -> Result<Option<DebugTraceStageSlot>> {
         let Some(inner) = &self.inner else {
-            return Ok(());
+            return Ok(None);
         };
 
-        let stage_filename = {
+        let (artifact_prefix, stage_filename) = {
             let mut state = inner
                 .state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("trace state lock poisoned"))?;
             state.next_stage_index += 1;
-            let filename = format!(
-                "{:04}_{}.json",
-                state.next_stage_index,
-                sanitize_stage_name(&record.stage_name)
+            let artifact_prefix = format!("{:04}", state.next_stage_index);
+            let stage_filename = format!(
+                "{}_{}.json",
+                artifact_prefix,
+                sanitize_stage_name(stage_name)
             );
-            state.manifest.stage_records.push(record.clone());
-            filename
+            (artifact_prefix, stage_filename)
         };
 
-        let stage_path = inner.root.join("stages").join(stage_filename);
-        let stage_bytes =
-            serde_json::to_vec_pretty(&record).context("failed to serialize stage trace record")?;
-        fs::write(&stage_path, stage_bytes)
-            .with_context(|| format!("failed to write stage trace {}", stage_path.display()))?;
-        self.write_manifest()
+        Ok(Some(DebugTraceStageSlot {
+            artifacts: DebugTraceArtifactScope::new(inner.clone(), artifact_prefix),
+            stage_path: inner.root.join("stages").join(stage_filename),
+        }))
     }
 
-    pub fn record_llm_call(&self, mut record: DebugTraceLlmCallRecord) -> Result<Option<String>> {
+    pub fn reserve_llm_call_slot(&self, stage_name: &str) -> Result<Option<DebugTraceLlmCallSlot>> {
         let Some(inner) = &self.inner else {
             return Ok(None);
         };
 
-        let (call_id, call_filename) = {
+        let (call_id, artifact_prefix, call_filename) = {
             let mut state = inner
                 .state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("trace state lock poisoned"))?;
             state.next_call_index += 1;
             let call_id = format!("call_{:04}", state.next_call_index);
-            let filename = format!(
-                "{:04}_{}.json",
-                state.next_call_index,
-                sanitize_stage_name(&record.stage_name)
+            let artifact_prefix = format!("{:04}", state.next_call_index);
+            let call_filename = format!(
+                "{}_{}.json",
+                artifact_prefix,
+                sanitize_stage_name(stage_name)
             );
-            record.call_id = call_id.clone();
-            state.manifest.llm_calls.push(record.clone());
-            (call_id, filename)
+            (call_id, artifact_prefix, call_filename)
         };
 
-        let call_path = inner.root.join("stages").join(call_filename);
-        let call_bytes = serde_json::to_vec_pretty(&record)
-            .context("failed to serialize llm call trace record")?;
-        fs::write(&call_path, call_bytes)
-            .with_context(|| format!("failed to write llm call trace {}", call_path.display()))?;
-        self.write_manifest()?;
-        Ok(Some(call_id))
+        Ok(Some(DebugTraceLlmCallSlot {
+            artifacts: DebugTraceArtifactScope::new(inner.clone(), artifact_prefix),
+            call_id,
+            call_path: inner.root.join("stages").join(call_filename),
+        }))
     }
 
     pub fn record_outcome(&self, outcome: &RunOutcome) -> Result<()> {
@@ -199,21 +191,57 @@ impl DebugTraceRecorder {
         self.inner.as_ref().map(|inner| inner.root.as_path())
     }
 
+    fn write_manifest(&self) -> Result<()> {
+        let Some(inner) = &self.inner else {
+            return Ok(());
+        };
+
+        write_manifest_for_inner(inner)
+    }
+}
+
+impl DebugTraceArtifactScope {
+    fn new(inner: Arc<DebugTraceRecorderInner>, artifact_prefix: String) -> Self {
+        Self {
+            inner,
+            artifact_prefix,
+        }
+    }
+
+    pub fn record_text_artifact(&self, kind: &str, content: &str) -> Result<Option<String>> {
+        self.record_bytes_artifact(kind, "txt", content.as_bytes())
+    }
+
+    pub fn record_json_artifact<T>(&self, kind: &str, value: &T) -> Result<Option<String>>
+    where
+        T: Serialize,
+    {
+        let bytes = serde_json::to_vec_pretty(value)
+            .with_context(|| format!("failed to serialize trace artifact {kind}"))?;
+        self.record_bytes_artifact(kind, "json", &bytes)
+    }
+
+    pub fn record_binary_artifact(
+        &self,
+        kind: &str,
+        extension: &str,
+        bytes: &[u8],
+    ) -> Result<Option<String>> {
+        self.record_bytes_artifact(kind, extension, bytes)
+    }
+
     fn record_bytes_artifact(
         &self,
         kind: &str,
         extension: &str,
         bytes: &[u8],
     ) -> Result<Option<String>> {
-        let Some(inner) = &self.inner else {
-            return Ok(None);
-        };
-
         let digest = Sha256::digest(bytes);
         let hash = format!("{digest:x}");
-        let id = format!("sha256:{hash}.{extension}");
-        let relative_path = format!("artifacts/{hash}.{extension}");
-        let artifact_path = inner.root.join(&relative_path);
+        let prefixed_name = format!("{}_{}.{}", self.artifact_prefix, hash, extension);
+        let id = format!("sha256:{prefixed_name}");
+        let relative_path = format!("artifacts/{prefixed_name}");
+        let artifact_path = self.inner.root.join(&relative_path);
 
         if !artifact_path.exists() {
             fs::write(&artifact_path, bytes).with_context(|| {
@@ -221,7 +249,8 @@ impl DebugTraceRecorder {
             })?;
         }
 
-        let mut state = inner
+        let mut state = self
+            .inner
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("trace state lock poisoned"))?;
@@ -238,26 +267,74 @@ impl DebugTraceRecorder {
             });
         }
         drop(state);
-
-        self.write_manifest()?;
+        write_manifest_for_inner(&self.inner)?;
         Ok(Some(id))
     }
+}
 
-    fn write_manifest(&self) -> Result<()> {
-        let Some(inner) = &self.inner else {
-            return Ok(());
-        };
+impl DebugTraceStageSlot {
+    pub fn artifacts(&self) -> &DebugTraceArtifactScope {
+        &self.artifacts
+    }
 
-        let state = inner
+    pub fn finish(self, record: DebugTraceStageRecord) -> Result<()> {
+        let stage_bytes =
+            serde_json::to_vec_pretty(&record).context("failed to serialize stage trace record")?;
+        fs::write(&self.stage_path, stage_bytes).with_context(|| {
+            format!("failed to write stage trace {}", self.stage_path.display())
+        })?;
+
+        let mut state = self
+            .artifacts
+            .inner
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("trace state lock poisoned"))?;
-        let manifest_path = inner.root.join("manifest.json");
-        let bytes = serde_json::to_vec_pretty(&state.manifest)
-            .context("failed to serialize trace manifest")?;
-        fs::write(&manifest_path, bytes)
-            .with_context(|| format!("failed to write trace manifest {}", manifest_path.display()))
+        state.manifest.stage_records.push(record);
+        drop(state);
+        write_manifest_for_inner(&self.artifacts.inner)
     }
+}
+
+impl DebugTraceLlmCallSlot {
+    pub fn artifacts(&self) -> &DebugTraceArtifactScope {
+        &self.artifacts
+    }
+
+    pub fn finish(self, mut record: DebugTraceLlmCallRecord) -> Result<Option<String>> {
+        record.call_id = self.call_id.clone();
+        let call_bytes = serde_json::to_vec_pretty(&record)
+            .context("failed to serialize llm call trace record")?;
+        fs::write(&self.call_path, call_bytes).with_context(|| {
+            format!(
+                "failed to write llm call trace {}",
+                self.call_path.display()
+            )
+        })?;
+
+        let mut state = self
+            .artifacts
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("trace state lock poisoned"))?;
+        state.manifest.llm_calls.push(record);
+        drop(state);
+        write_manifest_for_inner(&self.artifacts.inner)?;
+        Ok(Some(self.call_id))
+    }
+}
+
+fn write_manifest_for_inner(inner: &DebugTraceRecorderInner) -> Result<()> {
+    let state = inner
+        .state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("trace state lock poisoned"))?;
+    let manifest_path = inner.root.join("manifest.json");
+    let bytes =
+        serde_json::to_vec_pretty(&state.manifest).context("failed to serialize trace manifest")?;
+    fs::write(&manifest_path, bytes)
+        .with_context(|| format!("failed to write trace manifest {}", manifest_path.display()))
 }
 
 fn sanitize_stage_name(stage_name: &str) -> String {
@@ -291,7 +368,7 @@ mod tests {
     use rig::completion::Usage;
 
     #[test]
-    fn repeated_artifacts_are_deduplicated() {
+    fn repeated_artifacts_are_deduplicated_within_stage_slot() {
         let temp_dir = TempDir::new().expect("temp dir");
         let recorder = DebugTraceRecorder::new(
             temp_dir.path().join("trace"),
@@ -299,14 +376,63 @@ mod tests {
         )
         .expect("trace recorder");
 
-        let first = recorder
+        let stage = recorder
+            .reserve_stage_slot("sample")
+            .expect("reserve stage slot")
+            .expect("enabled stage slot");
+        let first = stage
+            .artifacts()
             .record_text_artifact("sample", "same content")
             .expect("first artifact");
-        let second = recorder
+        let second = stage
+            .artifacts()
             .record_text_artifact("sample", "same content")
             .expect("second artifact");
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn stage_artifacts_use_stage_index_prefix() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let recorder = DebugTraceRecorder::new(
+            temp_dir.path().join("trace"),
+            PathBuf::from("book.pdf").as_path(),
+        )
+        .expect("trace recorder");
+
+        let stage = recorder
+            .reserve_stage_slot("test stage")
+            .expect("reserve stage slot")
+            .expect("enabled stage slot");
+        let artifact_ref = stage
+            .artifacts()
+            .record_text_artifact("sample", "hello world")
+            .expect("record artifact")
+            .expect("artifact ref");
+        stage
+            .finish(DebugTraceStageRecord {
+                stage_name: "test stage".to_string(),
+                page_range: Some("1..2".to_string()),
+                worker: Some("worker 1/1".to_string()),
+                artifact_refs: vec![artifact_ref.clone()],
+                usage: DebugTraceUsageSnapshot::from_usage(&Usage::new()),
+                duration_ms: Some(10),
+            })
+            .expect("record stage");
+
+        assert!(artifact_ref.starts_with("sha256:0001_"));
+        let manifest_path = recorder.root().expect("root").join("manifest.json");
+        let manifest: DebugTraceManifest =
+            serde_json::from_slice(&fs::read(manifest_path).expect("read manifest"))
+                .expect("parse manifest");
+        assert_eq!(
+            manifest.stage_records[0].artifact_refs,
+            vec![artifact_ref.clone()]
+        );
+        let relative_path = &manifest.artifacts[0].relative_path;
+        assert!(relative_path.starts_with("artifacts/0001_"));
+        assert!(recorder.root().expect("root").join(relative_path).exists());
     }
 
     #[test]
@@ -318,12 +444,16 @@ mod tests {
         )
         .expect("trace recorder");
 
-        recorder
-            .record_stage(DebugTraceStageRecord {
+        let stage = recorder
+            .reserve_stage_slot("test stage")
+            .expect("reserve stage slot")
+            .expect("enabled stage slot");
+        stage
+            .finish(DebugTraceStageRecord {
                 stage_name: "test stage".to_string(),
                 page_range: Some("1..2".to_string()),
                 worker: Some("worker 1/1".to_string()),
-                artifact_refs: vec!["sha256:abc.txt".to_string()],
+                artifact_refs: vec!["sha256:0001_abc.txt".to_string()],
                 usage: DebugTraceUsageSnapshot::from_usage(&Usage::new()),
                 duration_ms: Some(10),
             })
@@ -349,31 +479,34 @@ mod tests {
         )
         .expect("trace recorder");
 
-        recorder
-            .record_llm_call(DebugTraceLlmCallRecord {
-                call_id: String::new(),
-                stage_name: "extract_toc_from_markdown".to_string(),
-                worker: Some("worker 1/1".to_string()),
-                page_range: Some("3..5".to_string()),
-                messages: vec![DebugTraceMessageRecord {
-                    role: "user".to_string(),
-                    parts: vec![DebugTraceMessagePartRecord {
-                        kind: "text".to_string(),
-                        artifact_ref: None,
-                        text: Some("hello".to_string()),
-                        media_type: None,
-                        detail: None,
-                    }],
+        let call = recorder
+            .reserve_llm_call_slot("extract_toc_from_markdown")
+            .expect("reserve llm call slot")
+            .expect("enabled llm call slot");
+        call.finish(DebugTraceLlmCallRecord {
+            call_id: String::new(),
+            stage_name: "extract_toc_from_markdown".to_string(),
+            worker: Some("worker 1/1".to_string()),
+            page_range: Some("3..5".to_string()),
+            messages: vec![DebugTraceMessageRecord {
+                role: "user".to_string(),
+                parts: vec![DebugTraceMessagePartRecord {
+                    kind: "text".to_string(),
+                    artifact_ref: None,
+                    text: Some("hello".to_string()),
+                    media_type: None,
+                    detail: None,
                 }],
-                output: DebugTraceLlmOutputRecord {
-                    raw_output_ref: None,
-                    repaired_output_ref: None,
-                    structured_output_ref: None,
-                },
-                usage: DebugTraceUsageSnapshot::from_usage(&Usage::new()),
-                duration_ms: Some(12),
-            })
-            .expect("record llm call");
+            }],
+            output: DebugTraceLlmOutputRecord {
+                raw_output_ref: None,
+                repaired_output_ref: None,
+                structured_output_ref: None,
+            },
+            usage: DebugTraceUsageSnapshot::from_usage(&Usage::new()),
+            duration_ms: Some(12),
+        })
+        .expect("record llm call");
 
         let manifest_path = recorder.root().expect("root").join("manifest.json");
         let manifest: DebugTraceManifest =
@@ -384,5 +517,6 @@ mod tests {
             manifest.llm_calls[0].stage_name,
             "extract_toc_from_markdown"
         );
+        assert_eq!(manifest.llm_calls[0].call_id, "call_0001");
     }
 }
