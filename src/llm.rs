@@ -1,12 +1,13 @@
 use anyhow::{Context, Result, bail};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use futures_util::StreamExt;
-use http::HeaderMap;
+use http::{HeaderMap, StatusCode};
 use rig::OneOrMany;
 use rig::agent::MultiTurnStreamItem;
 use rig::client::completion::CompletionClient;
-use rig::completion::{Prompt, Usage};
+use rig::completion::{CompletionError, Prompt, PromptError, Usage};
 use rig::extractor::ExtractionResponse;
+use rig::http_client;
 use rig::message::{
     AssistantContent, DocumentSourceKind, Image, ImageDetail, ImageMediaType, Message, UserContent,
 };
@@ -17,11 +18,12 @@ use schemars::schema_for;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
+    future::Future,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tracing::Span;
 use unicode_width::UnicodeWidthChar;
@@ -39,6 +41,9 @@ use crate::{
 
 const OUTPUT_WINDOW_LEN: usize = 44;
 const MAX_SCROLL_CHARS_PER_SECOND: f64 = 180.0;
+const MAX_LLM_ATTEMPTS: usize = 4;
+const INITIAL_LLM_RETRY_DELAY_MS: u64 = 500;
+const MAX_LLM_RETRY_DELAY_MS: u64 = 4_000;
 
 const TOC_DISCOVERY_PREAMBLE: &str = r#"
 You inspect sampled PDF page images and decide which pages are part of a real table of contents.
@@ -954,33 +959,208 @@ fn build_openai_client(config: &LlmConfig) -> Result<openai::CompletionsClient> 
         .context("failed to initialize OpenAI client")
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Structured LLM calls need explicit trace metadata and progress handles"
-)]
-async fn stream_structured_output<T>(
-    config: &LlmConfig,
+async fn retry_llm_operation<T, F, Fut>(
+    progress_span: Option<&Span>,
+    progress_label: &str,
+    operation_name: &str,
+    mut operation: F,
+) -> Result<(T, u64)>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    for attempt in 1..=MAX_LLM_ATTEMPTS {
+        match operation(attempt).await {
+            Ok(value) => return Ok((value, attempt as u64)),
+            Err(error) => {
+                let retryable = should_retry_llm_error(&error);
+                if !retryable || attempt == MAX_LLM_ATTEMPTS {
+                    return Err(error);
+                }
+
+                let delay = llm_retry_delay(attempt);
+                if let Some(span) = progress_span {
+                    set_spinner_message(
+                        span,
+                        llm_retry_wait_label(progress_label, attempt, MAX_LLM_ATTEMPTS, delay),
+                        None,
+                        None,
+                    );
+                }
+                tracing::warn!(
+                    attempt,
+                    max_attempts = MAX_LLM_ATTEMPTS,
+                    delay_ms = delay.as_millis() as u64,
+                    operation = operation_name,
+                    error = %error,
+                    "retrying transient LLM failure"
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+
+    unreachable!("LLM retry loop returns on success or terminal failure")
+}
+
+fn llm_attempt_progress_label(progress_label: &str, attempt: usize, max_attempts: usize) -> String {
+    if attempt <= 1 {
+        progress_label.to_string()
+    } else {
+        format!(
+            "{progress_label} | retry {}/{}",
+            attempt - 1,
+            max_attempts - 1
+        )
+    }
+}
+
+fn llm_retry_wait_label(
+    progress_label: &str,
+    failed_attempt: usize,
+    max_attempts: usize,
+    delay: Duration,
+) -> String {
+    format!(
+        "{progress_label} | retry {}/{} in {}ms",
+        failed_attempt,
+        max_attempts - 1,
+        delay.as_millis()
+    )
+}
+
+fn llm_retry_delay(failed_attempt: usize) -> Duration {
+    let shift = failed_attempt.saturating_sub(1).min(20) as u32;
+    let delay_ms = INITIAL_LLM_RETRY_DELAY_MS
+        .saturating_mul(1_u64 << shift)
+        .min(MAX_LLM_RETRY_DELAY_MS);
+    Duration::from_millis(delay_ms)
+}
+
+fn should_retry_llm_error(error: &anyhow::Error) -> bool {
+    for cause in error.chain() {
+        if let Some(prompt_error) = cause.downcast_ref::<PromptError>()
+            && let PromptError::CompletionError(completion_error) = prompt_error
+        {
+            return is_retryable_completion_error(completion_error);
+        }
+        if let Some(completion_error) = cause.downcast_ref::<CompletionError>() {
+            return is_retryable_completion_error(completion_error);
+        }
+        if let Some(http_error) = cause.downcast_ref::<http_client::Error>() {
+            return is_retryable_http_error(http_error);
+        }
+    }
+
+    is_retryable_message(&error.to_string())
+}
+
+fn is_retryable_completion_error(error: &CompletionError) -> bool {
+    match error {
+        CompletionError::HttpError(http_error) => is_retryable_http_error(http_error),
+        CompletionError::ProviderError(message) | CompletionError::ResponseError(message) => {
+            is_retryable_message(message)
+        }
+        CompletionError::RequestError(error) => is_retryable_message(&error.to_string()),
+        CompletionError::JsonError(_) | CompletionError::UrlError(_) => false,
+    }
+}
+
+fn is_retryable_http_error(error: &http_client::Error) -> bool {
+    match error {
+        http_client::Error::InvalidStatusCode(status) => is_retryable_status(*status),
+        http_client::Error::InvalidStatusCodeWithMessage(status, message) => {
+            is_retryable_status(*status) || is_retryable_message(message)
+        }
+        http_client::Error::Instance(error) => is_retryable_message(&error.to_string()),
+        http_client::Error::StreamEnded => true,
+        http_client::Error::Protocol(_)
+        | http_client::Error::InvalidHeaderValue(_)
+        | http_client::Error::NoHeaders
+        | http_client::Error::InvalidContentType(_) => false,
+    }
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn is_retryable_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    let non_retryable_markers = [
+        "context_length_exceeded",
+        "maximum context length",
+        "max_output_tokens",
+        "invalid api key",
+        "incorrect api key",
+        "authentication",
+        "unauthorized",
+        "forbidden",
+        "model_not_found",
+        "does not exist",
+        "invalid_request_error",
+        "unsupported",
+        "schema",
+    ];
+    if non_retryable_markers
+        .iter()
+        .any(|marker| message.contains(marker))
+    {
+        return false;
+    }
+
+    let retryable_markers = [
+        "http client error",
+        "error sending request",
+        "connection reset",
+        "connection refused",
+        "connection aborted",
+        "broken pipe",
+        "network error",
+        "temporarily unavailable",
+        "temporarily_unavailable",
+        "server_error",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "timed out",
+        "timeout",
+        "rate limit",
+        "too many requests",
+        "429",
+        "500 internal server error",
+        "502 bad gateway",
+        "503 service unavailable",
+        "504 gateway timeout",
+        "stream ended",
+        "response stream failed",
+        "overloaded",
+    ];
+    retryable_markers
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
+async fn stream_structured_output_once<T>(
+    client: &openai::CompletionsClient,
+    model: &str,
     preamble: &str,
     prompt: Message,
     progress_span: Option<&Span>,
     progress_label: &str,
-    trace_recorder: Option<&DebugTraceRecorder>,
-    stage_name: &str,
-    worker: Option<String>,
-    page_range: Option<String>,
-) -> Result<LlmCall<T>>
+) -> Result<(ExtractionResponse<T>, StructuredOutputTrace)>
 where
     T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
 {
     let started_at = Instant::now();
-    let client = build_openai_client(config)?;
-    let model = config.model.as_deref().unwrap_or(openai::GPT_4O_MINI);
     let agent = client
         .agent(model)
         .preamble(preamble)
         .output_schema::<T>()
         .build();
-    let mut stream = agent.stream_prompt(prompt.clone()).await;
+    let mut stream = agent.stream_prompt(prompt).await;
     let mut output_chars = 0usize;
     let mut streamed_text = String::new();
     let mut final_text = String::new();
@@ -1033,7 +1213,7 @@ where
         Ok(data) => (data, None, Usage::new(), None),
         Err(initial_error) => {
             let (repaired_json, repair_usage, repair_trace) =
-                repair_structured_output::<T>(&client, model, &final_text).await?;
+                repair_structured_output::<T>(client, model, &final_text).await?;
             let repaired_value = serde_json::from_str::<serde_json::Value>(&repaired_json).with_context(|| {
                 format!(
                     "failed to parse repaired structured response as JSON value. original: {final_text}; repaired: {}; initial error: {initial_error}",
@@ -1062,6 +1242,54 @@ where
         repair_trace,
     };
 
+    Ok((response, trace))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Structured LLM calls need explicit trace metadata and progress handles"
+)]
+async fn stream_structured_output<T>(
+    config: &LlmConfig,
+    preamble: &str,
+    prompt: Message,
+    progress_span: Option<&Span>,
+    progress_label: &str,
+    trace_recorder: Option<&DebugTraceRecorder>,
+    stage_name: &str,
+    worker: Option<String>,
+    page_range: Option<String>,
+) -> Result<LlmCall<T>>
+where
+    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
+{
+    let client = build_openai_client(config)?;
+    let model = config.model.as_deref().unwrap_or(openai::GPT_4O_MINI);
+    let (response, calls) = retry_llm_operation(
+        progress_span,
+        progress_label,
+        "structured output request",
+        |attempt| {
+            let client = client.clone();
+            let prompt = prompt.clone();
+            let attempt_label =
+                llm_attempt_progress_label(progress_label, attempt, MAX_LLM_ATTEMPTS);
+            async move {
+                stream_structured_output_once::<T>(
+                    &client,
+                    model,
+                    preamble,
+                    prompt,
+                    progress_span,
+                    &attempt_label,
+                )
+                .await
+            }
+        },
+    )
+    .await?;
+    let (response, trace) = response;
+
     if let Some(recorder) = trace_recorder {
         record_llm_call_trace(
             recorder,
@@ -1078,7 +1306,7 @@ where
     Ok(LlmCall {
         data: response.data,
         usage: response.usage,
-        calls: 1,
+        calls,
         trace: Some(trace),
     })
 }
@@ -1533,16 +1761,24 @@ where
         ))])
         .context("repair prompt cannot be empty")?,
     };
-    let repaired = client
-        .agent(model)
-        .preamble(
-            "You repair malformed structured outputs. Return only valid JSON that conforms exactly to the provided schema.",
-        )
-        .build()
-        .prompt(repair_prompt.clone())
-        .extended_details()
-        .await
-        .context("failed to repair malformed structured output")?;
+    let (repaired, _) = retry_llm_operation(
+        None,
+        "repair malformed structured output",
+        "structured output repair",
+        |_| async {
+            client
+                .agent(model)
+                .preamble(
+                    "You repair malformed structured outputs. Return only valid JSON that conforms exactly to the provided schema.",
+                )
+                .build()
+                .prompt(repair_prompt.clone())
+                .extended_details()
+                .await
+                .context("failed to repair malformed structured output")
+        },
+    )
+    .await?;
     let structured_output = repaired.output.clone();
     Ok((
         structured_output.clone(),
@@ -1869,7 +2105,7 @@ mod tests {
     use futures_util::StreamExt;
     use rig::agent::MultiTurnStreamItem;
     use rig::client::CompletionClient;
-    use rig::completion::Prompt;
+    use rig::completion::{CompletionError, Prompt, PromptError};
     use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
     use serde::Deserialize;
     use std::collections::BTreeMap;
@@ -1881,7 +2117,7 @@ mod tests {
         TocPageAssessmentAnswer, TocPageMarkdownAnswer, VisionRequestConfig, VisualReviewAnswer,
         batch_page_range_label, bind_page_label_observations, bind_toc_markdown_pages,
         bind_toc_page_assessments, bind_visual_review_results, build_openai_client, display_width,
-        identify_toc_pages, take_prefix_width, take_suffix_width,
+        identify_toc_pages, should_retry_llm_error, take_prefix_width, take_suffix_width,
     };
     use crate::config::{CliArgs, resolve_args};
     use crate::model::{TocPageEvidence, TocPageMarkdown, VisualReviewRequest};
@@ -1955,6 +2191,27 @@ mod tests {
             serde_json::from_value(repaired_value).expect("deserialize repaired value");
         assert_eq!(parsed.pages.len(), 1);
         assert_eq!(parsed.pages[0].physical_page, 18);
+    }
+
+    #[test]
+    fn retry_classifier_accepts_transient_provider_transport_errors() {
+        let error = anyhow::Error::new(PromptError::CompletionError(
+            CompletionError::ProviderError(
+                "Http client error: error sending request for url (https://example.com/v1/chat/completions)"
+                    .to_string(),
+            ),
+        ));
+        assert!(should_retry_llm_error(&error));
+    }
+
+    #[test]
+    fn retry_classifier_rejects_context_window_failures() {
+        let error = anyhow::Error::new(PromptError::CompletionError(
+            CompletionError::ProviderError(
+                "context_length_exceeded: maximum context length exceeded".to_string(),
+            ),
+        ));
+        assert!(!should_retry_llm_error(&error));
     }
 
     #[tokio::test]
