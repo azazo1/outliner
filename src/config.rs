@@ -37,6 +37,8 @@ pub struct CliArgs {
     pub config: Option<PathBuf>,
     #[arg(long)]
     pub toc: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub trace: Option<PathBuf>,
     #[arg(
         long = "vision-worker-batch-size",
         value_name = "N",
@@ -65,6 +67,7 @@ pub struct AppArgs {
     pub api_base: Option<String>,
     pub api_key: Option<String>,
     pub toc: Option<PageRangeSpec>,
+    pub trace: Option<PathBuf>,
     pub vision_worker_batch_size: usize,
     pub vision_workers: usize,
     pub external_process_concurrency: usize,
@@ -135,6 +138,7 @@ fn merge_args(cli: CliArgs, file: FileConfig) -> Result<AppArgs> {
         model,
         config: _,
         toc,
+        trace,
         vision_worker_batch_size,
         vision_workers,
         external_process_concurrency,
@@ -155,6 +159,7 @@ fn merge_args(cli: CliArgs, file: FileConfig) -> Result<AppArgs> {
         api_base: normalize_optional_string(api_base),
         api_key: normalize_optional_string(api_key),
         toc: toc.map(|value| parse_toc_range(&value)).transpose()?,
+        trace,
         vision_worker_batch_size: normalize_positive_usize(
             vision_worker_batch_size.or(file_vision_worker_batch_size),
             DEFAULT_VISION_WORKER_BATCH_SIZE,
@@ -251,6 +256,7 @@ mod tests {
             model: Some("gpt-4.1-mini".to_string()),
             config: None,
             toc: Some("4..9".to_string()),
+            trace: Some(PathBuf::from("trace")),
             vision_worker_batch_size: Some(2),
             vision_workers: Some(3),
             external_process_concurrency: Some(6),
@@ -278,6 +284,7 @@ mod tests {
                     start: Some(4),
                     end: Some(9)
                 }),
+                trace: Some(PathBuf::from("trace")),
                 vision_worker_batch_size: 2,
                 vision_workers: 3,
                 external_process_concurrency: 6,
@@ -293,6 +300,7 @@ mod tests {
             model: None,
             config: None,
             toc: None,
+            trace: None,
             vision_worker_batch_size: None,
             vision_workers: None,
             external_process_concurrency: None,
@@ -309,6 +317,7 @@ mod tests {
                 api_base: None,
                 api_key: None,
                 toc: None,
+                trace: None,
                 vision_worker_batch_size: DEFAULT_VISION_WORKER_BATCH_SIZE,
                 vision_workers: DEFAULT_VISION_WORKERS,
                 external_process_concurrency: default_external_process_concurrency(),

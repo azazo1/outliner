@@ -1,4 +1,5 @@
 mod config;
+mod debug_trace;
 mod llm;
 mod model;
 mod pdf_support;
@@ -6,6 +7,7 @@ mod progress;
 mod qpdf_outline;
 
 use std::{
+    collections::{BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
 };
@@ -18,14 +20,18 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::{
     config::{AppArgs, CliArgs, resolve_args},
+    debug_trace::DebugTraceRecorder,
     llm::{
-        LlmCall, LlmConfig, TocPageAssessmentBatch, VisionRequestConfig,
-        build_fallback_toc_structure_guide, extract_toc, extract_toc_structure,
-        guide_covers_structure, identify_toc_pages, infer_toc_from_page_text, observe_page_labels,
-        organize_toc_structure, toc_structure_guide_is_reliable,
+        LlmCall, LlmConfig, StructuredOutputTrace, TocPageAssessmentBatch, VisionRequestConfig,
+        VisionPageObservation, extract_toc_from_markdown, identify_toc_pages,
+        infer_toc_from_page_text, observe_page_labels, review_toc_visual_gaps,
+        transcribe_toc_pages_to_markdown,
     },
     model::{
-        OutlineEntry, PageRange, RunOutcome, normalize_outline_for_compare, normalize_toc_entries,
+        DebugTraceStageRecord, DebugTraceUsageSnapshot, ExtractedPageText, OutlineEntry,
+        PageRange, RenderedPage, RunOutcome, TocMarkdownDocument, TocPageEvidence,
+        TocPageMarkdown, VisualReviewRequest, dedupe_optional_text_pair,
+        markdown_context_budget_exceeded, normalize_outline_for_compare, normalize_toc_entries,
     },
     pdf_support::{PdfWorkspace, is_toc_hit},
     progress::{
@@ -40,7 +46,13 @@ use crate::{
 async fn main() -> Result<()> {
     init_tracing();
     let args = resolve_args(CliArgs::parse())?;
-    let outcome = run(args).await?;
+    let trace_recorder = if let Some(trace_dir) = args.trace.clone() {
+        DebugTraceRecorder::new(trace_dir, &args.input)?
+    } else {
+        DebugTraceRecorder::disabled()
+    };
+    let outcome = run(args, &trace_recorder).await?;
+    trace_recorder.record_outcome(&outcome)?;
 
     match outcome {
         RunOutcome::NoTocFound {
@@ -80,7 +92,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run(args: AppArgs) -> Result<RunOutcome> {
+async fn run(args: AppArgs, trace_recorder: &DebugTraceRecorder) -> Result<RunOutcome> {
     let stage_count = stage_count_for(&args);
     let run_span = start_run_progress(&args.input, stage_count);
     let _run_guard = run_span.enter();
@@ -158,6 +170,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
             vision_request_config,
             &run_span,
             &mut agent_progress,
+            trace_recorder,
         )
         .await?;
         finish_stage(
@@ -236,149 +249,363 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         &agent_progress.usage,
         agent_progress.calls,
     );
+    record_rendered_page_stage(
+        trace_recorder,
+        "render_toc_pages",
+        &rendered_toc_pages,
+        &agent_progress.usage,
+    )?;
 
     set_run_status(
         &run_span,
         &args.input,
-        "extracting TOC structure",
+        "extracting TOC page text",
         &agent_progress.usage,
         agent_progress.calls,
     );
-    let structure_span = start_spinner(
-        "extract_toc_structure",
+    let toc_text_span = start_bar(
+        "extract_toc_page_text",
+        toc_pages.len() as u64,
+        format!("extracting TOC page text {}", toc_pages.len()),
+    );
+    let extracted_toc_text = match workspace
+        .extract_page_text_with_progress(&toc_pages, |completed, physical_page| {
+            toc_text_span.pb_set_position(completed as u64);
+            set_bar_message(
+                &toc_text_span,
+                format!(
+                    "extracting TOC text from page {physical_page} ({completed}/{})",
+                    toc_pages.len()
+                ),
+            );
+        })
+        .await
+    {
+        Ok(pages) => pages,
+        Err(error) => {
+            tracing::warn!(error = %error, "TOC PDF text extraction failed");
+            Vec::new()
+        }
+    };
+    drop(toc_text_span);
+    finish_stage(
+        &run_span,
+        &args.input,
+        "TOC page text ready",
+        &agent_progress.usage,
+        agent_progress.calls,
+    );
+    record_text_stage(
+        trace_recorder,
+        "extract_toc_page_text",
+        &extracted_toc_text,
+        &agent_progress.usage,
+    )?;
+
+    set_run_status(
+        &run_span,
+        &args.input,
+        "OCRing TOC pages",
+        &agent_progress.usage,
+        agent_progress.calls,
+    );
+    let toc_ocr_span = start_bar(
+        "ocr_toc_pages",
+        toc_pages.len() as u64,
+        format!("OCRing TOC pages {}", toc_pages.len()),
+    );
+    let ocr_toc_text = match workspace
+        .ocr_page_text_with_progress(&toc_pages, |completed, physical_page| {
+            toc_ocr_span.pb_set_position(completed as u64);
+            set_bar_message(
+                &toc_ocr_span,
+                format!(
+                    "OCRing TOC page {physical_page} ({completed}/{})",
+                    toc_pages.len()
+                ),
+            );
+        })
+        .await
+    {
+        Ok(pages) => pages,
+        Err(error) => {
+            tracing::warn!(error = %error, "TOC OCR extraction failed");
+            Vec::new()
+        }
+    };
+    drop(toc_ocr_span);
+    finish_stage(
+        &run_span,
+        &args.input,
+        "TOC OCR ready",
+        &agent_progress.usage,
+        agent_progress.calls,
+    );
+    record_text_stage(
+        trace_recorder,
+        "ocr_toc_pages",
+        &ocr_toc_text,
+        &agent_progress.usage,
+    )?;
+
+    set_run_status(
+        &run_span,
+        &args.input,
+        "preparing TOC evidence",
+        &agent_progress.usage,
+        agent_progress.calls,
+    );
+    let evidence_span = start_spinner("collect_toc_page_evidence", "preparing TOC evidence");
+    let toc_evidence = build_toc_page_evidence(
+        &rendered_toc_pages,
+        &extracted_toc_text,
+        &ocr_toc_text,
+    );
+    drop(evidence_span);
+    finish_stage(
+        &run_span,
+        &args.input,
+        "TOC evidence ready",
+        &agent_progress.usage,
+        agent_progress.calls,
+    );
+    record_toc_evidence_stage(trace_recorder, &toc_evidence, &agent_progress.usage)?;
+
+    set_run_status(
+        &run_span,
+        &args.input,
+        "transcribing TOC pages",
+        &agent_progress.usage,
+        agent_progress.calls,
+    );
+    let transcribe_span = start_spinner(
+        "transcribe_toc_pages",
         format!(
-            "extracting TOC structure from {}",
+            "transcribing TOC pages {}",
             format_rendered_page_range(&rendered_toc_pages)
         ),
     );
-    let structure_message = format!(
-        "extracting TOC structure from {}",
+    let transcribe_message = format!(
+        "transcribing TOC pages {}",
         format_rendered_page_range(&rendered_toc_pages)
     );
     let LlmCall {
-        data: extracted_structure,
+        data: toc_markdown_pages,
         usage,
         calls,
-    } = extract_toc_structure(
+        ..
+    } = transcribe_toc_pages_to_markdown(
         &llm_config,
         vision_request_config,
-        &rendered_toc_pages,
-        Some(&structure_span),
-        &structure_message,
+        &toc_evidence,
+        Some(&transcribe_span),
+        &transcribe_message,
+        trace_recorder.is_enabled().then_some(trace_recorder),
     )
-    .instrument(structure_span.clone())
+    .instrument(transcribe_span.clone())
     .await?;
     agent_progress.record(usage, calls);
     tracing::info!(
-        toc_found = extracted_structure.toc_found,
-        level_count = extracted_structure.levels.len(),
+        page_count = toc_markdown_pages.len(),
         usage_total_tokens = usage.total_tokens,
-        "TOC structure extracted"
+        "TOC pages transcribed"
     );
-    drop(structure_span);
+    drop(transcribe_span);
     finish_stage(
         &run_span,
         &args.input,
-        "TOC structure ready",
+        "TOC markdown ready",
         &agent_progress.usage,
         agent_progress.calls,
     );
+    record_toc_markdown_stage(
+        trace_recorder,
+        "transcribe_toc_pages_to_markdown",
+        &toc_markdown_pages,
+        &usage,
+        None,
+    )?;
 
     set_run_status(
         &run_span,
         &args.input,
-        "organizing TOC structure",
+        "assembling TOC markdown",
         &agent_progress.usage,
         agent_progress.calls,
     );
-    let guide_span = start_spinner("organize_toc_structure", "organizing TOC structure");
-    let guide_message = format!(
-        "organizing TOC structure from {} levels",
-        extracted_structure.levels.len()
-    );
-    let fallback_guide = build_fallback_toc_structure_guide(&extracted_structure);
-    let LlmCall {
-        data: organized_guide,
-        usage,
-        calls,
-    } = organize_toc_structure(
-        &llm_config,
-        &extracted_structure,
-        Some(&guide_span),
-        &guide_message,
-    )
-    .instrument(guide_span.clone())
-    .await?;
-    agent_progress.record(usage, calls);
-    let structure_guide = if toc_structure_guide_is_reliable(&extracted_structure, &organized_guide)
-    {
-        organized_guide
-    } else {
-        tracing::warn!(
-            raw_level_count = extracted_structure.levels.len(),
-            organized_level_count = organized_guide.levels.len(),
-            guide_covers_structure = guide_covers_structure(&extracted_structure, &organized_guide),
-            "organized TOC structure guide was unreliable; falling back to merged structure"
-        );
-        fallback_guide
-    };
-    tracing::info!(
-        toc_found = structure_guide.toc_found,
-        level_count = structure_guide.levels.len(),
-        usage_total_tokens = usage.total_tokens,
-        "TOC structure organized"
-    );
-    drop(guide_span);
+    let assemble_span = start_spinner("assemble_toc_markdown", "assembling TOC markdown");
+    let toc_markdown_document = TocMarkdownDocument::from_pages(toc_markdown_pages.clone());
+    if markdown_context_budget_exceeded(&toc_markdown_document.combined_markdown) {
+        anyhow::bail!("TOC markdown exceeds the model context budget; narrow --toc");
+    }
+    drop(assemble_span);
     finish_stage(
         &run_span,
         &args.input,
-        "TOC structure organized",
+        "TOC markdown assembled",
         &agent_progress.usage,
         agent_progress.calls,
     );
+    record_toc_markdown_document_stage(
+        trace_recorder,
+        &toc_markdown_document,
+        &agent_progress.usage,
+    )?;
 
     set_run_status(
         &run_span,
         &args.input,
-        "extracting TOC",
+        "extracting TOC from markdown",
         &agent_progress.usage,
         agent_progress.calls,
     );
     let extract_span = start_spinner(
-        "extract_toc",
+        "extract_toc_from_markdown",
         format!(
-            "extracting TOC from {}",
+            "extracting TOC from markdown {}",
             format_rendered_page_range(&rendered_toc_pages)
         ),
     );
     let extract_message = format!(
-        "extracting TOC from {}",
+        "extracting TOC from markdown {}",
         format_rendered_page_range(&rendered_toc_pages)
     );
     let LlmCall {
-        data: extracted,
+        data: initial_extracted,
         usage,
         calls,
-    } = extract_toc(
+        trace,
+    } = extract_toc_from_markdown(
         &llm_config,
-        vision_request_config,
-        &rendered_toc_pages,
-        Some(&structure_guide),
+        &toc_markdown_document,
+        &[],
         Some(&extract_span),
         &extract_message,
     )
     .instrument(extract_span.clone())
     .await?;
     agent_progress.record(usage, calls);
+    drop(extract_span);
+    record_llm_stage(
+        trace_recorder,
+        "extract_toc_from_markdown",
+        Some(format_rendered_page_range(&rendered_toc_pages)),
+        None,
+        &toc_markdown_document.combined_markdown,
+        &usage,
+        trace.as_ref(),
+    )?;
+
+    let extracted = if initial_extracted.review_requests.is_empty() {
+        finish_stage(
+            &run_span,
+            &args.input,
+            "TOC review skipped",
+            &agent_progress.usage,
+            agent_progress.calls,
+        );
+        initial_extracted
+    } else {
+        set_run_status(
+            &run_span,
+            &args.input,
+            "reviewing unclear TOC regions",
+            &agent_progress.usage,
+            agent_progress.calls,
+        );
+        let review_pages = review_prefetch_pages(&initial_extracted.review_requests);
+        let rendered_review_pages = collect_review_rendered_pages(
+            &workspace,
+            &rendered_toc_pages,
+            &review_pages,
+        )
+        .await?;
+        record_rendered_page_stage(
+            trace_recorder,
+            "render_review_pages",
+            &rendered_review_pages,
+            &agent_progress.usage,
+        )?;
+        let review_span = start_spinner(
+            "review_toc_visual_gaps",
+            format!("reviewing TOC pages {}", format_rendered_page_range(&rendered_review_pages)),
+        );
+        let review_message = format!(
+            "reviewing TOC pages {}",
+            format_rendered_page_range(&rendered_review_pages)
+        );
+        let LlmCall {
+            data: review_results,
+            usage,
+            calls,
+            trace,
+        } = review_toc_visual_gaps(
+            &llm_config,
+            &initial_extracted.review_requests,
+            &rendered_review_pages,
+            &toc_markdown_document,
+            Some(&review_span),
+            &review_message,
+        )
+        .instrument(review_span.clone())
+        .await?;
+        agent_progress.record(usage, calls);
+        drop(review_span);
+        finish_stage(
+            &run_span,
+            &args.input,
+            "TOC review ready",
+            &agent_progress.usage,
+            agent_progress.calls,
+        );
+        record_visual_review_stage(
+            trace_recorder,
+            &initial_extracted.review_requests,
+            &review_results,
+            &usage,
+            trace.as_ref(),
+        )?;
+
+        let reextract_span = start_spinner(
+            "reextract_toc_from_markdown",
+            "re-extracting TOC from markdown with review notes",
+        );
+        let reextract_message = "re-extracting TOC from markdown with review notes".to_string();
+        let LlmCall {
+            data: reviewed_extracted,
+            usage,
+            calls,
+            trace,
+        } = extract_toc_from_markdown(
+            &llm_config,
+            &toc_markdown_document,
+            &review_results,
+            Some(&reextract_span),
+            &reextract_message,
+        )
+        .instrument(reextract_span.clone())
+        .await?;
+        agent_progress.record(usage, calls);
+        drop(reextract_span);
+        record_llm_stage(
+            trace_recorder,
+            "reextract_toc_from_markdown",
+            Some(format_rendered_page_range(&rendered_toc_pages)),
+            None,
+            &toc_markdown_document.combined_markdown,
+            &usage,
+            trace.as_ref(),
+        )?;
+        reviewed_extracted
+    };
+
     tracing::info!(
         toc_found = extracted.toc_found,
         entry_count = extracted.entries.len(),
         toc_start_page = ?extracted.toc_start_page,
         toc_end_page = ?extracted.toc_end_page,
-        usage_total_tokens = usage.total_tokens,
-        "TOC extracted"
+        "TOC extracted from markdown"
     );
-    drop(extract_span);
     finish_stage(
         &run_span,
         &args.input,
@@ -394,7 +621,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         "TOC normalized"
     );
 
-    if !extracted.toc_found || toc_entries.len() < 2 {
+    if !extracted.review_requests.is_empty() || !extracted.toc_found || toc_entries.len() < 2 {
         mark_complete(
             &run_span,
             &args.input,
@@ -456,6 +683,12 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         &agent_progress.usage,
         agent_progress.calls,
     );
+    record_rendered_page_stage(
+        trace_recorder,
+        "render_label_sample_pages",
+        &rendered_label_pages,
+        &agent_progress.usage,
+    )?;
 
     set_run_status(
         &run_span,
@@ -479,6 +712,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         data: observations,
         usage,
         calls,
+        trace,
     } = observe_page_labels(
         &llm_config,
         vision_request_config,
@@ -503,6 +737,7 @@ async fn run(args: AppArgs) -> Result<RunOutcome> {
         &agent_progress.usage,
         agent_progress.calls,
     );
+    record_page_label_stage(trace_recorder, &observations, &usage, trace.as_ref())?;
 
     set_run_status(
         &run_span,
@@ -673,6 +908,7 @@ async fn discover_toc_range(
     vision_request_config: VisionRequestConfig,
     run_span: &tracing::Span,
     agent_progress: &mut AgentProgress,
+    trace_recorder: &DebugTraceRecorder,
 ) -> Result<Option<PageRange>> {
     let mut candidate_range = workspace.initial_toc_search_range(args.toc);
     let mut last_range = None;
@@ -732,6 +968,7 @@ async fn discover_toc_range(
                     args.toc,
                     workspace,
                     candidate_range,
+                    trace_recorder,
                 )
                 .await?
                 {
@@ -793,6 +1030,7 @@ async fn discover_toc_range(
                     args.toc,
                     workspace,
                     candidate_range,
+                    trace_recorder,
                 )
                 .await?
                 {
@@ -875,6 +1113,7 @@ async fn discover_toc_range(
             data: toc_page_batch,
             usage,
             calls,
+            trace,
         } = identify_toc_pages(
             llm_config,
             vision_request_config,
@@ -900,6 +1139,15 @@ async fn discover_toc_range(
             "TOC pages detected"
         );
         drop(discovery_span);
+        record_llm_stage(
+            trace_recorder,
+            "identify_toc_pages",
+            Some(format!("{}..{}", candidate_range.start, candidate_range.end)),
+            None,
+            "",
+            &usage,
+            trace.as_ref(),
+        )?;
 
         if hit_count > 0 {
             let refined = workspace.refine_toc_range(args.toc, &toc_page_batch);
@@ -948,6 +1196,7 @@ async fn try_discover_toc_range_from_text(
     toc_hint: Option<crate::model::PageRangeSpec>,
     workspace: &PdfWorkspace,
     candidate_range: PageRange,
+    trace_recorder: &DebugTraceRecorder,
 ) -> Result<Option<PageRange>> {
     if extracted_pages.is_empty() {
         return Ok(None);
@@ -992,7 +1241,12 @@ async fn try_discover_toc_range_from_text(
         extracted_pages.len()
     );
     let infer_span = start_spinner("infer_toc_from_text", infer_message.clone());
-    let LlmCall { data, usage, calls } = infer_toc_from_page_text(
+    let LlmCall {
+        data,
+        usage,
+        calls,
+        trace,
+    } = infer_toc_from_page_text(
         llm_config,
         &extracted_pages,
         Some(&infer_span),
@@ -1002,6 +1256,15 @@ async fn try_discover_toc_range_from_text(
     .await?;
     agent_progress.record(usage, calls);
     drop(infer_span);
+    record_llm_stage(
+        trace_recorder,
+        "infer_toc_from_page_text",
+        Some(format!("{}..{}", candidate_range.start, candidate_range.end)),
+        None,
+        &summarize_extracted_pages(&extracted_pages),
+        &usage,
+        trace.as_ref(),
+    )?;
 
     let batch = TocPageAssessmentBatch {
         toc_found: data.toc_found,
@@ -1077,6 +1340,388 @@ fn format_rendered_page_range(pages: &[crate::model::RenderedPage]) -> String {
         format!("page {first}")
     } else {
         format!("page {first}..{last}")
+    }
+}
+
+fn build_toc_page_evidence(
+    rendered_pages: &[RenderedPage],
+    extracted_pages: &[ExtractedPageText],
+    ocr_pages: &[ExtractedPageText],
+) -> Vec<TocPageEvidence> {
+    let extracted_by_page = extracted_pages
+        .iter()
+        .map(|page| (page.physical_page, page.text.clone()))
+        .collect::<HashMap<_, _>>();
+    let ocr_by_page = ocr_pages
+        .iter()
+        .map(|page| (page.physical_page, page.text.clone()))
+        .collect::<HashMap<_, _>>();
+
+    rendered_pages
+        .iter()
+        .map(|rendered_page| {
+            let (pdf_text, ocr_text) = dedupe_optional_text_pair(
+                extracted_by_page.get(&rendered_page.physical_page).cloned(),
+                ocr_by_page.get(&rendered_page.physical_page).cloned(),
+            );
+            TocPageEvidence {
+                physical_page: rendered_page.physical_page,
+                pdf_text,
+                ocr_text,
+                rendered_page: rendered_page.clone(),
+            }
+        })
+        .collect()
+}
+
+fn summarize_extracted_pages(pages: &[ExtractedPageText]) -> String {
+    pages.iter()
+        .map(|page| {
+            format!(
+                "PDF physical page {}\n---BEGIN TEXT---\n{}\n---END TEXT---",
+                page.physical_page, page.text
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn summarize_toc_evidence(pages: &[TocPageEvidence]) -> String {
+    pages.iter()
+        .map(|page| {
+            format!(
+                "PDF physical page {}\n[pdf_text]\n{}\n[ocr_text]\n{}",
+                page.physical_page,
+                page.pdf_text.as_deref().unwrap_or("[[none]]"),
+                page.ocr_text.as_deref().unwrap_or("[[none]]")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn record_rendered_page_stage(
+    trace_recorder: &DebugTraceRecorder,
+    stage_name: &str,
+    pages: &[RenderedPage],
+    usage: &Usage,
+) -> Result<()> {
+    if !trace_recorder.is_enabled() {
+        return Ok(());
+    }
+
+    let mut artifact_refs = Vec::new();
+    for page in pages {
+        if let Some(artifact_ref) =
+            trace_recorder.record_binary_artifact("rendered_page_png", "png", &page.png_bytes)?
+        {
+            artifact_refs.push(artifact_ref);
+        }
+    }
+    trace_recorder.record_stage(DebugTraceStageRecord {
+        stage_name: stage_name.to_string(),
+        page_range: Some(format_rendered_page_range(pages)),
+        worker: None,
+        artifact_refs,
+        usage: DebugTraceUsageSnapshot::from_usage(usage),
+        duration_ms: None,
+    })
+}
+
+fn record_text_stage(
+    trace_recorder: &DebugTraceRecorder,
+    stage_name: &str,
+    pages: &[ExtractedPageText],
+    usage: &Usage,
+) -> Result<()> {
+    if !trace_recorder.is_enabled() {
+        return Ok(());
+    }
+
+    let mut artifact_refs = Vec::new();
+    if let Some(artifact_ref) =
+        trace_recorder.record_text_artifact(stage_name, &summarize_extracted_pages(pages))?
+    {
+        artifact_refs.push(artifact_ref);
+    }
+    trace_recorder.record_stage(DebugTraceStageRecord {
+        stage_name: stage_name.to_string(),
+        page_range: page_range_from_numbers(&pages.iter().map(|page| page.physical_page).collect::<Vec<_>>()),
+        worker: None,
+        artifact_refs,
+        usage: DebugTraceUsageSnapshot::from_usage(usage),
+        duration_ms: None,
+    })
+}
+
+fn record_toc_evidence_stage(
+    trace_recorder: &DebugTraceRecorder,
+    evidence_pages: &[TocPageEvidence],
+    usage: &Usage,
+) -> Result<()> {
+    if !trace_recorder.is_enabled() {
+        return Ok(());
+    }
+
+    let mut artifact_refs = Vec::new();
+    if let Some(artifact_ref) =
+        trace_recorder.record_text_artifact("toc_page_evidence", &summarize_toc_evidence(evidence_pages))?
+    {
+        artifact_refs.push(artifact_ref);
+    }
+    trace_recorder.record_stage(DebugTraceStageRecord {
+        stage_name: "collect_toc_page_evidence".to_string(),
+        page_range: page_range_from_numbers(
+            &evidence_pages
+                .iter()
+                .map(|page| page.physical_page)
+                .collect::<Vec<_>>(),
+        ),
+        worker: None,
+        artifact_refs,
+        usage: DebugTraceUsageSnapshot::from_usage(usage),
+        duration_ms: None,
+    })
+}
+
+fn record_toc_markdown_stage(
+    trace_recorder: &DebugTraceRecorder,
+    stage_name: &str,
+    pages: &[TocPageMarkdown],
+    usage: &Usage,
+    trace: Option<&StructuredOutputTrace>,
+) -> Result<()> {
+    if !trace_recorder.is_enabled() {
+        return Ok(());
+    }
+
+    let mut artifact_refs = Vec::new();
+    if let Some(artifact_ref) = trace_recorder.record_json_artifact(stage_name, &pages)? {
+        artifact_refs.push(artifact_ref);
+    }
+    extend_trace_artifacts(trace_recorder, &mut artifact_refs, trace)?;
+    trace_recorder.record_stage(DebugTraceStageRecord {
+        stage_name: stage_name.to_string(),
+        page_range: page_range_from_numbers(
+            &pages.iter().map(|page| page.physical_page).collect::<Vec<_>>(),
+        ),
+        worker: None,
+        artifact_refs,
+        usage: DebugTraceUsageSnapshot::from_usage(usage),
+        duration_ms: trace.map(|trace| trace.duration_ms),
+    })
+}
+
+fn record_toc_markdown_document_stage(
+    trace_recorder: &DebugTraceRecorder,
+    document: &TocMarkdownDocument,
+    usage: &Usage,
+) -> Result<()> {
+    if !trace_recorder.is_enabled() {
+        return Ok(());
+    }
+
+    let mut artifact_refs = Vec::new();
+    if let Some(artifact_ref) = trace_recorder.record_text_artifact(
+        "toc_markdown_document",
+        &document.combined_markdown,
+    )? {
+        artifact_refs.push(artifact_ref);
+    }
+    trace_recorder.record_stage(DebugTraceStageRecord {
+        stage_name: "assemble_toc_markdown".to_string(),
+        page_range: page_range_from_numbers(
+            &document
+                .pages
+                .iter()
+                .map(|page| page.physical_page)
+                .collect::<Vec<_>>(),
+        ),
+        worker: None,
+        artifact_refs,
+        usage: DebugTraceUsageSnapshot::from_usage(usage),
+        duration_ms: None,
+    })
+}
+
+fn record_page_label_stage(
+    trace_recorder: &DebugTraceRecorder,
+    observations: &[VisionPageObservation],
+    usage: &Usage,
+    trace: Option<&StructuredOutputTrace>,
+) -> Result<()> {
+    if !trace_recorder.is_enabled() {
+        return Ok(());
+    }
+
+    let mut artifact_refs = Vec::new();
+    if let Some(artifact_ref) =
+        trace_recorder.record_json_artifact("page_label_observations", &observations)?
+    {
+        artifact_refs.push(artifact_ref);
+    }
+    extend_trace_artifacts(trace_recorder, &mut artifact_refs, trace)?;
+    trace_recorder.record_stage(DebugTraceStageRecord {
+        stage_name: "observe_page_labels".to_string(),
+        page_range: page_range_from_numbers(
+            &observations
+                .iter()
+                .map(|observation| observation.physical_page)
+                .collect::<Vec<_>>(),
+        ),
+        worker: None,
+        artifact_refs,
+        usage: DebugTraceUsageSnapshot::from_usage(usage),
+        duration_ms: trace.map(|trace| trace.duration_ms),
+    })
+}
+
+fn record_visual_review_stage(
+    trace_recorder: &DebugTraceRecorder,
+    requests: &[VisualReviewRequest],
+    results: &[crate::model::VisualReviewResult],
+    usage: &Usage,
+    trace: Option<&StructuredOutputTrace>,
+) -> Result<()> {
+    if !trace_recorder.is_enabled() {
+        return Ok(());
+    }
+
+    let mut artifact_refs = Vec::new();
+    if let Some(artifact_ref) = trace_recorder.record_json_artifact("toc_review_requests", &requests)?
+    {
+        artifact_refs.push(artifact_ref);
+    }
+    if let Some(artifact_ref) = trace_recorder.record_json_artifact("toc_review_results", &results)? {
+        artifact_refs.push(artifact_ref);
+    }
+    extend_trace_artifacts(trace_recorder, &mut artifact_refs, trace)?;
+    trace_recorder.record_stage(DebugTraceStageRecord {
+        stage_name: "review_toc_visual_gaps".to_string(),
+        page_range: page_range_from_numbers(
+            &requests
+                .iter()
+                .map(|request| request.physical_page)
+                .collect::<Vec<_>>(),
+        ),
+        worker: None,
+        artifact_refs,
+        usage: DebugTraceUsageSnapshot::from_usage(usage),
+        duration_ms: trace.map(|trace| trace.duration_ms),
+    })
+}
+
+fn record_llm_stage(
+    trace_recorder: &DebugTraceRecorder,
+    stage_name: &str,
+    page_range: Option<String>,
+    worker: Option<String>,
+    input_text: &str,
+    usage: &Usage,
+    trace: Option<&StructuredOutputTrace>,
+) -> Result<()> {
+    if !trace_recorder.is_enabled() {
+        return Ok(());
+    }
+
+    let mut artifact_refs = Vec::new();
+    if !input_text.trim().is_empty()
+        && let Some(artifact_ref) = trace_recorder.record_text_artifact(
+            &format!("{stage_name}_input"),
+            input_text,
+        )?
+    {
+        artifact_refs.push(artifact_ref);
+    }
+    extend_trace_artifacts(trace_recorder, &mut artifact_refs, trace)?;
+    trace_recorder.record_stage(DebugTraceStageRecord {
+        stage_name: stage_name.to_string(),
+        page_range,
+        worker,
+        artifact_refs,
+        usage: DebugTraceUsageSnapshot::from_usage(usage),
+        duration_ms: trace.map(|trace| trace.duration_ms),
+    })
+}
+
+fn extend_trace_artifacts(
+    trace_recorder: &DebugTraceRecorder,
+    artifact_refs: &mut Vec<String>,
+    trace: Option<&StructuredOutputTrace>,
+) -> Result<()> {
+    let Some(trace) = trace else {
+        return Ok(());
+    };
+
+    if let Some(artifact_ref) =
+        trace_recorder.record_text_artifact("llm_raw_output", &trace.raw_output)?
+    {
+        artifact_refs.push(artifact_ref);
+    }
+    if let Some(repaired_output) = trace.repaired_output.as_ref()
+        && let Some(artifact_ref) =
+            trace_recorder.record_text_artifact("llm_repaired_output", repaired_output)?
+    {
+        artifact_refs.push(artifact_ref);
+    }
+    if let Some(artifact_ref) =
+        trace_recorder.record_text_artifact("llm_structured_output", &trace.structured_output)?
+    {
+        artifact_refs.push(artifact_ref);
+    }
+    Ok(())
+}
+
+fn review_prefetch_pages(requests: &[VisualReviewRequest]) -> Vec<usize> {
+    let mut pages = BTreeSet::new();
+    for request in requests {
+        if request.physical_page > 1 {
+            pages.insert(request.physical_page - 1);
+        }
+        pages.insert(request.physical_page);
+    }
+    pages.into_iter().collect()
+}
+
+async fn collect_review_rendered_pages(
+    workspace: &PdfWorkspace,
+    existing_pages: &[RenderedPage],
+    requested_pages: &[usize],
+) -> Result<Vec<RenderedPage>> {
+    let mut rendered_by_page = existing_pages
+        .iter()
+        .map(|page| (page.physical_page, page.clone()))
+        .collect::<HashMap<_, _>>();
+    let missing_pages = requested_pages
+        .iter()
+        .copied()
+        .filter(|page| !rendered_by_page.contains_key(page))
+        .collect::<Vec<_>>();
+
+    if !missing_pages.is_empty() {
+        let rendered_missing = workspace
+            .render_pages_with_progress(&missing_pages, |_, _| {})
+            .await?;
+        for page in rendered_missing {
+            rendered_by_page.insert(page.physical_page, page);
+        }
+    }
+
+    let mut collected = requested_pages
+        .iter()
+        .filter_map(|page| rendered_by_page.get(page).cloned())
+        .collect::<Vec<_>>();
+    collected.sort_by_key(|page| page.physical_page);
+    Ok(collected)
+}
+
+fn page_range_from_numbers(pages: &[usize]) -> Option<String> {
+    let first = pages.first().copied()?;
+    let last = pages.last().copied().unwrap_or(first);
+    if first == last {
+        Some(first.to_string())
+    } else {
+        Some(format!("{first}..{last}"))
     }
 }
 
@@ -1223,6 +1868,7 @@ mod tests {
                 start: Some(3),
                 end: Some(7),
             }),
+            trace: None,
             vision_worker_batch_size: 4,
             vision_workers: 4,
             external_process_concurrency: 4,

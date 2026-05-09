@@ -15,6 +15,118 @@ pub struct ExtractedPageText {
     pub text: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct TocPageEvidence {
+    pub physical_page: usize,
+    pub pdf_text: Option<String>,
+    pub ocr_text: Option<String>,
+    pub rendered_page: RenderedPage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct TocPageMarkdown {
+    #[schemars(required)]
+    pub physical_page: usize,
+    #[schemars(required)]
+    pub markdown: String,
+    #[schemars(required)]
+    pub layout_notes: String,
+    #[schemars(required)]
+    pub has_unclear_regions: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TocMarkdownDocument {
+    pub pages: Vec<TocPageMarkdown>,
+    pub combined_markdown: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct VisualReviewRequest {
+    #[schemars(required)]
+    pub physical_page: usize,
+    #[schemars(required)]
+    pub reason: String,
+    #[schemars(required)]
+    pub line_hint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct VisualReviewResult {
+    #[schemars(required)]
+    pub physical_page: usize,
+    #[schemars(required)]
+    pub line_hint: String,
+    #[schemars(required)]
+    pub clarification: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct DebugTraceManifest {
+    #[schemars(required)]
+    pub input_path: String,
+    #[schemars(required)]
+    pub output_path: Option<String>,
+    #[schemars(required)]
+    pub stage_records: Vec<DebugTraceStageRecord>,
+    #[schemars(required)]
+    pub artifacts: Vec<DebugTraceArtifactRecord>,
+    #[schemars(required)]
+    pub final_outcome: Option<DebugTraceOutcomeRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct DebugTraceArtifactRecord {
+    #[schemars(required)]
+    pub id: String,
+    #[schemars(required)]
+    pub kind: String,
+    #[schemars(required)]
+    pub relative_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct DebugTraceStageRecord {
+    #[schemars(required)]
+    pub stage_name: String,
+    #[schemars(required)]
+    pub page_range: Option<String>,
+    #[schemars(required)]
+    pub worker: Option<String>,
+    #[schemars(required)]
+    pub artifact_refs: Vec<String>,
+    #[schemars(required)]
+    pub usage: DebugTraceUsageSnapshot,
+    #[schemars(required)]
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct DebugTraceUsageSnapshot {
+    #[schemars(required)]
+    pub input_tokens: u64,
+    #[schemars(required)]
+    pub output_tokens: u64,
+    #[schemars(required)]
+    pub total_tokens: u64,
+    #[schemars(required)]
+    pub cached_input_tokens: u64,
+    #[schemars(required)]
+    pub cache_creation_input_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct DebugTraceOutcomeRecord {
+    #[schemars(required)]
+    pub status: String,
+    #[schemars(required)]
+    pub reason: Option<String>,
+    #[schemars(required)]
+    pub entries: Option<usize>,
+    #[schemars(required)]
+    pub output_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageRange {
     pub start: usize,
@@ -68,6 +180,8 @@ pub struct TocExtraction {
     pub entries: Vec<TocCandidateEntry>,
     #[schemars(required)]
     pub notes: Option<String>,
+    #[schemars(required)]
+    pub review_requests: Vec<VisualReviewRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -125,6 +239,34 @@ pub enum RunOutcome {
         usage: Usage,
         agent_calls: u64,
     },
+}
+
+impl TocMarkdownDocument {
+    pub fn from_pages(mut pages: Vec<TocPageMarkdown>) -> Self {
+        pages.sort_by_key(|page| page.physical_page);
+        let combined_markdown = pages
+            .iter()
+            .map(render_toc_markdown_page)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        Self {
+            pages,
+            combined_markdown,
+        }
+    }
+}
+
+impl DebugTraceUsageSnapshot {
+    pub fn from_usage(usage: &Usage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        }
+    }
 }
 
 pub fn normalize_toc_entries(entries: Vec<TocCandidateEntry>) -> Vec<TocCandidateEntry> {
@@ -198,6 +340,60 @@ pub fn clean_title(input: &str) -> String {
         .to_string()
 }
 
+pub fn collapse_inline_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub fn dedupe_optional_text_pair(
+    left: Option<String>,
+    right: Option<String>,
+) -> (Option<String>, Option<String>) {
+    match (left, right) {
+        (Some(left_text), Some(right_text))
+            if normalize_dedup_text(&left_text) == normalize_dedup_text(&right_text) =>
+        {
+            (Some(left_text), None)
+        }
+        (left, right) => (left, right),
+    }
+}
+
+pub fn markdown_context_budget_exceeded(markdown: &str) -> bool {
+    markdown.chars().count() > 120_000
+}
+
+pub fn format_toc_review_appendix(
+    review_results: &[VisualReviewResult],
+) -> Option<String> {
+    if review_results.is_empty() {
+        return None;
+    }
+
+    let mut sections = Vec::with_capacity(review_results.len());
+    for result in review_results {
+        sections.push(format!(
+            "### Review page {}\n- line hint: {}\n- clarification: {}",
+            result.physical_page,
+            collapse_inline_whitespace(&result.line_hint),
+            collapse_inline_whitespace(&result.clarification)
+        ));
+    }
+
+    Some(format!(
+        "## Visual Review Notes\n\n{}",
+        sections.join("\n\n")
+    ))
+}
+
+pub fn render_toc_markdown_page(page: &TocPageMarkdown) -> String {
+    format!(
+        "# TOC Page {}\n\nLayout: {}\n\n{}",
+        page.physical_page,
+        collapse_inline_whitespace(&page.layout_notes),
+        page.markdown.trim()
+    )
+}
+
 pub fn sanitize_title(input: &str) -> String {
     let re = Regex::new(r"[\p{White_Space}\p{P}\p{S}]+").expect("title sanitize regex");
     re.replace_all(&input.to_lowercase(), "").into_owned()
@@ -256,6 +452,10 @@ fn extract_roman_page_number(value: &str) -> Option<String> {
         .and_then(|captures| captures.get(1))
         .map(|matched| matched.as_str().to_ascii_lowercase())
         .filter(|roman| is_roman_numeral(roman))
+}
+
+fn normalize_dedup_text(input: &str) -> String {
+    collapse_inline_whitespace(input).to_ascii_lowercase()
 }
 
 fn find_numbering_level(
@@ -326,8 +526,9 @@ fn roman_to_number(value: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PageLabel, PageRange, PageRangeSpec, TocCandidateEntry, clean_title,
-        extract_leading_numbering, normalize_toc_entries, parse_page_label, sanitize_title,
+        PageLabel, PageRange, PageRangeSpec, TocCandidateEntry, TocMarkdownDocument,
+        TocPageMarkdown, clean_title, dedupe_optional_text_pair, extract_leading_numbering,
+        normalize_toc_entries, parse_page_label, render_toc_markdown_page, sanitize_title,
     };
 
     #[test]
@@ -450,6 +651,52 @@ mod tests {
             .resolve(20),
             Some(PageRange { start: 1, end: 4 })
         );
+    }
+
+    #[test]
+    fn duplicate_pdf_and_ocr_text_is_deduplicated() {
+        let (pdf_text, ocr_text) = dedupe_optional_text_pair(
+            Some("目录  第一章".to_string()),
+            Some("目录 第一章".to_string()),
+        );
+
+        assert_eq!(pdf_text, Some("目录  第一章".to_string()));
+        assert_eq!(ocr_text, None);
+    }
+
+    #[test]
+    fn toc_markdown_document_sorts_pages_and_combines_them() {
+        let document = TocMarkdownDocument::from_pages(vec![
+            TocPageMarkdown {
+                physical_page: 3,
+                markdown: "## Region 1 (body)\n```text\nB\n```".to_string(),
+                layout_notes: "single column".to_string(),
+                has_unclear_regions: false,
+            },
+            TocPageMarkdown {
+                physical_page: 2,
+                markdown: "## Region 1 (body)\n```text\nA\n```".to_string(),
+                layout_notes: "double column".to_string(),
+                has_unclear_regions: true,
+            },
+        ]);
+
+        assert_eq!(document.pages[0].physical_page, 2);
+        assert!(document.combined_markdown.contains("# TOC Page 2"));
+        assert!(document.combined_markdown.contains("# TOC Page 3"));
+    }
+
+    #[test]
+    fn rendered_toc_markdown_page_includes_layout_prefix() {
+        let rendered = render_toc_markdown_page(&TocPageMarkdown {
+            physical_page: 8,
+            markdown: "## Region 1 (body)\n```text\n目录\n```".to_string(),
+            layout_notes: "boxed heading".to_string(),
+            has_unclear_regions: false,
+        });
+
+        assert!(rendered.contains("# TOC Page 8"));
+        assert!(rendered.contains("Layout: boxed heading"));
     }
 
     trait LabelToString {

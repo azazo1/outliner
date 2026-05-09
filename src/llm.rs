@@ -14,7 +14,7 @@ use schemars::JsonSchema;
 use schemars::schema_for;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::VecDeque,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -24,62 +24,18 @@ use std::{
 use tracing::Span;
 use unicode_width::UnicodeWidthChar;
 
-use crate::model::{ExtractedPageText, RenderedPage, TocExtraction};
+use crate::{
+    debug_trace::DebugTraceRecorder,
+    model::{
+        DebugTraceStageRecord, DebugTraceUsageSnapshot, ExtractedPageText, RenderedPage,
+        TocExtraction, TocMarkdownDocument, TocPageEvidence, TocPageMarkdown, VisualReviewRequest,
+        VisualReviewResult, format_toc_review_appendix,
+    },
+};
 use crate::progress::{set_spinner_message, start_spinner};
 
 const OUTPUT_WINDOW_LEN: usize = 44;
 const MAX_SCROLL_CHARS_PER_SECOND: f64 = 180.0;
-
-const EXTRACTION_PREAMBLE: &str = r#"
-You extract a PDF table of contents into a flat outline sequence.
-
-Rules:
-- Decide whether the provided pages contain a real table of contents.
-- If there is no real table of contents, return toc_found = false, toc_start_page = null, toc_end_page = null, and entries = [].
-- Only extract entries that are explicitly present in the table of contents pages.
-- Set toc_start_page and toc_end_page to the earliest and latest physical pages among the provided images that actually belong to the table of contents.
-- Preserve hierarchy using level. Top-level entries must use level = 1.
-- Output entries in reading order.
-- Copy each title exactly as printed in the table of contents.
-- Preserve numbering, prefixes, bullets, and punctuation that belong to the title, such as `六.`, `Chapter 3`, or `Appendix A`.
-- Use the field `page` for the printed TOC page exactly as shown. It may be arabic digits or roman numerals, and it is not the PDF physical page number.
-- Do not paraphrase, translate, shorten, normalize, or drop any part of a title.
-- Do not invent missing titles, levels, or `page` values.
-- Ignore running headers, footers, and body text that is not part of the table of contents.
-"#;
-
-const TOC_STRUCTURE_PREAMBLE: &str = r#"
-You inspect PDF table-of-contents pages and extract only their hierarchy structure.
-
-Rules:
-- Decide whether the provided pages contain a real table of contents.
-- If there is no real table of contents, return toc_found = false, levels = [], and notes explaining why when useful.
-- Extract every distinct hierarchy level that is actually evidenced in the provided TOC pages.
-- Do not list every TOC item.
-- Represent each distinct level at most once per batch.
-- Use level = 1 for top-level TOC entries.
-- Use the field `description` to summarize the cues that distinguish this level, such as numbering style, wording, indentation, or visual grouping.
-- Use the field `examples` for a few short representative titles copied exactly from the page.
-- Keep examples in reading order and return at most 3 examples per level.
-- Do not invent hidden parents, missing entries, or unsupported levels.
-"#;
-
-const TOC_STRUCTURE_GUIDE_PREAMBLE: &str = r#"
-You consolidate merged table-of-contents structure evidence into a final normalized hierarchy guide.
-
-Rules:
-- The input is merged structure evidence from all TOC page batches.
-- Produce one final guide record per level.
-- Return toc_found = false, levels = [], and notes explaining why when useful if the merged evidence does not support a real TOC.
-- Top-level entries must use level = 1.
-- Use parent_level = null only for top-level entries. Every other level must reference a lower existing level.
-- Use description to summarize the stable cues that distinguish the level.
-- Use numbering_patterns for short canonical patterns such as `1`, `1.1`, `I`, `Chapter N`, `Appendix A`, or `none`.
-- Keep examples short and copied exactly from the merged evidence.
-- Preserve coverage. If the merged evidence contains a real observed level, do not drop it unless notes clearly explain why it was noise.
-- Resolve overlapping or conflicting cues into one normalized guide.
-- Do not invent unsupported levels or impossible parent relationships.
-"#;
 
 const TOC_DISCOVERY_PREAMBLE: &str = r#"
 You inspect sampled PDF page images and decide which pages are part of a real table of contents.
@@ -117,6 +73,48 @@ Rules:
 - toc_found should be true when at least one page is marked as hit.
 "#;
 
+const TOC_MARKDOWN_TRANSCRIPTION_PREAMBLE: &str = r#"
+You transcribe PDF table-of-contents pages into high-fidelity markdown page records.
+
+Rules:
+- Return one page record per input page, in the same order.
+- Preserve all TOC-relevant detail, including indentation, dot leaders, numbering, page labels, column order, boxed headings, side notes, and unusual layout cues.
+- Use `layout_notes` for a compact summary of the page layout and reading order.
+- Use `markdown` only for region blocks. Start each region with `## Region N (kind)` and put the region content in fenced `text` blocks.
+- Keep visual separators and line breaks when they help disambiguate TOC structure.
+- Mark unclear or unreadable fragments as `[[unclear: ...]]`.
+- Do not guess missing words or page numbers.
+- Do not paraphrase, translate, normalize, or collapse stylized TOC text into prose.
+- Use `has_unclear_regions = true` when any important fragment is unclear.
+"#;
+
+const TOC_MARKDOWN_EXTRACTION_PREAMBLE: &str = r#"
+You extract a PDF table of contents from a combined markdown document produced from TOC page transcriptions.
+
+Rules:
+- Decide whether the document contains a real TOC.
+- Use the markdown page boundaries, layout notes, and region content as the primary evidence.
+- Only extract entries that are explicitly supported by the markdown or the provided visual review notes.
+- Preserve title text exactly as printed, including numbering and punctuation that belong to the title.
+- Use level = 1 for top-level entries.
+- Use the field `page` for the printed TOC page label exactly as shown.
+- When the markdown is insufficient for a reliable decision, return a `review_requests` item instead of guessing.
+- Each review request must include `physical_page`, `reason`, and `line_hint`.
+- After review notes are provided, consume them and return `review_requests = []` unless the TOC is still unreliable.
+"#;
+
+const TOC_VISUAL_REVIEW_PREAMBLE: &str = r#"
+You review original TOC page images to clarify specific ambiguous markdown regions.
+
+Rules:
+- The request JSON lists the unclear page and line hint for each clarification.
+- The provided images may include the requested page and the immediately preceding page for context.
+- Return one result per request.
+- Use `clarification` to state the minimum concrete detail needed to resolve the ambiguity.
+- Do not restate the whole page.
+- Do not invent missing text when the image is still unreadable.
+"#;
+
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
     pub model: Option<String>,
@@ -129,6 +127,15 @@ pub struct LlmCall<T> {
     pub data: T,
     pub usage: Usage,
     pub calls: u64,
+    pub trace: Option<StructuredOutputTrace>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructuredOutputTrace {
+    pub raw_output: String,
+    pub repaired_output: Option<String>,
+    pub structured_output: String,
+    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -174,52 +181,6 @@ pub struct TocTextInferenceBatch {
     pub assessments: Vec<TocPageAssessment>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct TocStructureLevel {
-    #[schemars(required)]
-    pub level: u8,
-    #[schemars(required)]
-    pub description: String,
-    #[schemars(required)]
-    pub examples: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct TocStructureExtraction {
-    #[schemars(required)]
-    pub toc_found: bool,
-    #[schemars(required)]
-    pub notes: Option<String>,
-    #[schemars(required)]
-    pub levels: Vec<TocStructureLevel>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct TocStructureGuideLevel {
-    #[schemars(required)]
-    pub level: u8,
-    #[schemars(required)]
-    pub parent_level: Option<u8>,
-    #[schemars(required)]
-    pub description: String,
-    #[schemars(required)]
-    pub numbering_patterns: Vec<String>,
-    #[schemars(required)]
-    pub examples: Vec<String>,
-    #[schemars(required)]
-    pub notes: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct TocStructureGuide {
-    #[schemars(required)]
-    pub toc_found: bool,
-    #[schemars(required)]
-    pub notes: Option<String>,
-    #[schemars(required)]
-    pub levels: Vec<TocStructureGuideLevel>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VisionPageObservation {
     #[schemars(required)]
@@ -238,6 +199,18 @@ struct ObservedPrintedPageLabel {
 struct VisionPageObservationBatch {
     #[schemars(required)]
     observations: Vec<ObservedPrintedPageLabel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct TocMarkdownTranscriptionBatch {
+    #[schemars(required)]
+    pages: Vec<TocPageMarkdown>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct VisualReviewBatch {
+    #[schemars(required)]
+    results: Vec<VisualReviewResult>,
 }
 
 pub async fn identify_toc_pages(
@@ -294,93 +267,6 @@ pub async fn infer_toc_from_page_text(
     .await
 }
 
-pub async fn extract_toc(
-    config: &LlmConfig,
-    request_config: VisionRequestConfig,
-    pages: &[RenderedPage],
-    guide: Option<&TocStructureGuide>,
-    progress_span: Option<&Span>,
-    progress_label: &str,
-) -> Result<LlmCall<TocExtraction>> {
-    if pages.is_empty() {
-        bail!("no candidate pages were provided to the LLM extractor");
-    }
-
-    let instruction = Arc::<str>::from(build_toc_extraction_instruction(guide)?);
-    let batches = chunk_rendered_pages(pages, request_config.batch_size);
-    stream_batched_structured_output(
-        config,
-        request_config,
-        batches,
-        move |batch_pages| {
-            build_multimodal_message(batch_pages, instruction.as_ref())
-        },
-        merge_toc_extractions,
-        EXTRACTION_PREAMBLE,
-        progress_span,
-        progress_label,
-    )
-    .await
-}
-
-pub async fn organize_toc_structure(
-    config: &LlmConfig,
-    structure: &TocStructureExtraction,
-    progress_span: Option<&Span>,
-    progress_label: &str,
-) -> Result<LlmCall<TocStructureGuide>> {
-    if !structure.toc_found || structure.levels.is_empty() {
-        return Ok(LlmCall {
-            data: build_fallback_toc_structure_guide(structure),
-            usage: Usage::new(),
-            calls: 0,
-        });
-    }
-
-    let prompt = build_toc_structure_guide_message(
-        structure,
-        "Consolidate this merged TOC structure evidence into one final normalized hierarchy guide.",
-    )?;
-    stream_structured_output(
-        config,
-        TOC_STRUCTURE_GUIDE_PREAMBLE,
-        prompt,
-        progress_span,
-        progress_label,
-    )
-    .await
-}
-
-pub async fn extract_toc_structure(
-    config: &LlmConfig,
-    request_config: VisionRequestConfig,
-    pages: &[RenderedPage],
-    progress_span: Option<&Span>,
-    progress_label: &str,
-) -> Result<LlmCall<TocStructureExtraction>> {
-    if pages.is_empty() {
-        bail!("no candidate pages were provided to the TOC structure extractor");
-    }
-
-    let batches = chunk_rendered_pages(pages, request_config.batch_size);
-    stream_batched_structured_output(
-        config,
-        request_config,
-        batches,
-        |batch_pages| {
-            build_multimodal_message(
-                batch_pages,
-                "Determine whether these PDF pages contain a table of contents, then extract only the hierarchy structure.",
-            )
-        },
-        merge_toc_structure_extractions,
-        TOC_STRUCTURE_PREAMBLE,
-        progress_span,
-        progress_label,
-    )
-    .await
-}
-
 pub async fn observe_page_labels(
     config: &LlmConfig,
     request_config: VisionRequestConfig,
@@ -393,6 +279,7 @@ pub async fn observe_page_labels(
             data: Vec::new(),
             usage: Usage::new(),
             calls: 0,
+            trace: None,
         });
     }
 
@@ -418,6 +305,241 @@ pub async fn observe_page_labels(
         data: observations,
         usage: response.usage,
         calls: response.calls,
+        trace: None,
+    })
+}
+
+pub async fn transcribe_toc_pages_to_markdown(
+    config: &LlmConfig,
+    request_config: VisionRequestConfig,
+    pages: &[TocPageEvidence],
+    progress_span: Option<&Span>,
+    progress_label: &str,
+    trace_recorder: Option<&DebugTraceRecorder>,
+) -> Result<LlmCall<Vec<TocPageMarkdown>>> {
+    if pages.is_empty() {
+        bail!("no TOC page evidence was provided for markdown transcription");
+    }
+
+    let batches = pages
+        .chunks(request_config.batch_size.max(1))
+        .map(|chunk| chunk.to_vec())
+        .collect::<Vec<_>>();
+    let total_batches = batches.len();
+    let total_pages = pages.len();
+    let worker_count = request_config.concurrency.max(1).min(total_batches);
+    let queue = Arc::new(Mutex::new(VecDeque::from(
+        batches
+            .into_iter()
+            .enumerate()
+            .map(|(index, pages)| QueuedEvidenceBatch { index, pages })
+            .collect::<Vec<_>>(),
+    )));
+    let completed_batches = Arc::new(AtomicUsize::new(0));
+    let completed_pages = Arc::new(AtomicUsize::new(0));
+    let mut usage = Usage::new();
+    let mut calls = 0u64;
+    let mut ordered = Vec::with_capacity(total_batches);
+    let mut handles = Vec::with_capacity(worker_count);
+
+    update_batch_progress(
+        progress_span,
+        progress_label,
+        0,
+        total_batches,
+        0,
+        total_pages,
+    );
+
+    for worker_index in 0..worker_count {
+        let worker_span = start_spinner(
+            "llm_worker",
+            worker_idle_label(progress_label, worker_index, worker_count),
+        );
+        let config = config.clone();
+        let queue = Arc::clone(&queue);
+        let completed_batches = Arc::clone(&completed_batches);
+        let completed_pages = Arc::clone(&completed_pages);
+        let parent_span = progress_span.cloned();
+        let progress_label = progress_label.to_string();
+        let trace_recorder = trace_recorder.cloned();
+
+        handles.push(tokio::spawn(async move {
+            let mut results = Vec::new();
+
+            loop {
+                let Some(batch) = pop_queued_evidence_batch(&queue)? else {
+                    break;
+                };
+
+                let prompt = build_toc_markdown_transcription_message(&batch.pages)?;
+                let page_range_label = evidence_page_range_label(&batch.pages);
+                let response = stream_structured_output::<TocMarkdownTranscriptionBatch>(
+                    &config,
+                    TOC_MARKDOWN_TRANSCRIPTION_PREAMBLE,
+                    prompt,
+                    Some(&worker_span),
+                    &worker_batch_label(worker_index, worker_count, &page_range_label),
+                )
+                .await?;
+
+                if let Some(recorder) = trace_recorder.as_ref() {
+                    let mut artifact_refs = Vec::new();
+                    if let Some(input_ref) = recorder.record_text_artifact(
+                        "toc_markdown_worker_input",
+                        &build_toc_markdown_worker_input_summary(&batch.pages),
+                    )? {
+                        artifact_refs.push(input_ref);
+                    }
+                    if let Some(trace) = response.trace.as_ref() {
+                        if let Some(raw_ref) = recorder
+                            .record_text_artifact("toc_markdown_worker_raw_output", &trace.raw_output)?
+                        {
+                            artifact_refs.push(raw_ref);
+                        }
+                        if let Some(repaired_output) = trace.repaired_output.as_ref()
+                            && let Some(repaired_ref) = recorder.record_text_artifact(
+                                "toc_markdown_worker_repaired_output",
+                                repaired_output,
+                            )?
+                        {
+                            artifact_refs.push(repaired_ref);
+                        }
+                        if let Some(structured_ref) = recorder.record_text_artifact(
+                            "toc_markdown_worker_structured_output",
+                            &trace.structured_output,
+                        )? {
+                            artifact_refs.push(structured_ref);
+                        }
+                    }
+                    recorder.record_stage(DebugTraceStageRecord {
+                        stage_name: "transcribe_toc_pages_to_markdown".to_string(),
+                        page_range: Some(page_range_label.clone()),
+                        worker: Some(format!("worker {}/{}", worker_index + 1, worker_count)),
+                        artifact_refs,
+                        usage: DebugTraceUsageSnapshot::from_usage(&response.usage),
+                        duration_ms: response.trace.as_ref().map(|trace| trace.duration_ms),
+                    })?;
+                }
+
+                let finished_batches = completed_batches.fetch_add(1, Ordering::Relaxed) + 1;
+                let finished_pages =
+                    completed_pages.fetch_add(batch.pages.len(), Ordering::Relaxed) + batch.pages.len();
+                update_batch_progress(
+                    parent_span.as_ref(),
+                    &progress_label,
+                    finished_batches,
+                    total_batches,
+                    finished_pages,
+                    total_pages,
+                );
+                set_spinner_message(
+                    &worker_span,
+                    worker_idle_label(&progress_label, worker_index, worker_count),
+                    None,
+                    None,
+                );
+                results.push(BatchResult {
+                    index: batch.index,
+                    response,
+                });
+            }
+
+            set_spinner_message(
+                &worker_span,
+                worker_done_label(&progress_label, worker_index, worker_count),
+                None,
+                None,
+            );
+            drop(worker_span);
+            Ok::<_, anyhow::Error>(results)
+        }));
+    }
+
+    for handle in handles {
+        let worker_results = handle.await.map_err(anyhow::Error::new)??;
+        for result in worker_results {
+            usage += result.response.usage;
+            calls += result.response.calls;
+            ordered.push((result.index, result.response.data));
+        }
+    }
+
+    ordered.sort_by_key(|(index, _)| *index);
+    let merged = merge_toc_markdown_batches(
+        ordered
+            .into_iter()
+            .flat_map(|(_, batch)| batch.pages.into_iter())
+            .collect(),
+    )?;
+
+    update_batch_progress(
+        progress_span,
+        progress_label,
+        total_batches,
+        total_batches,
+        total_pages,
+        total_pages,
+    );
+
+    Ok(LlmCall {
+        data: merged,
+        usage,
+        calls,
+        trace: None,
+    })
+}
+
+pub async fn extract_toc_from_markdown(
+    config: &LlmConfig,
+    document: &TocMarkdownDocument,
+    review_results: &[VisualReviewResult],
+    progress_span: Option<&Span>,
+    progress_label: &str,
+) -> Result<LlmCall<TocExtraction>> {
+    let prompt = build_toc_markdown_extraction_message(document, review_results)?;
+    stream_structured_output(
+        config,
+        TOC_MARKDOWN_EXTRACTION_PREAMBLE,
+        prompt,
+        progress_span,
+        progress_label,
+    )
+    .await
+}
+
+pub async fn review_toc_visual_gaps(
+    config: &LlmConfig,
+    requests: &[VisualReviewRequest],
+    pages: &[RenderedPage],
+    document: &TocMarkdownDocument,
+    progress_span: Option<&Span>,
+    progress_label: &str,
+) -> Result<LlmCall<Vec<VisualReviewResult>>> {
+    if requests.is_empty() {
+        return Ok(LlmCall {
+            data: Vec::new(),
+            usage: Usage::new(),
+            calls: 0,
+            trace: None,
+        });
+    }
+
+    let prompt = build_visual_review_message(requests, pages, document)?;
+    let response = stream_structured_output::<VisualReviewBatch>(
+        config,
+        TOC_VISUAL_REVIEW_PREAMBLE,
+        prompt,
+        progress_span,
+        progress_label,
+    )
+    .await?;
+
+    Ok(LlmCall {
+        data: response.data.results,
+        usage: response.usage,
+        calls: response.calls,
+        trace: response.trace,
     })
 }
 
@@ -432,6 +554,12 @@ fn chunk_rendered_pages(pages: &[RenderedPage], batch_size: usize) -> Vec<Vec<Re
 struct QueuedBatch {
     index: usize,
     pages: Vec<RenderedPage>,
+}
+
+#[derive(Debug)]
+struct QueuedEvidenceBatch {
+    index: usize,
+    pages: Vec<TocPageEvidence>,
 }
 
 #[derive(Debug)]
@@ -472,120 +600,14 @@ fn merge_toc_page_assessment_batches(
     })
 }
 
-fn merge_toc_extractions(mut batches: Vec<TocExtraction>) -> Result<TocExtraction> {
-    if batches.is_empty() {
-        bail!("no TOC extraction batches were returned");
+fn merge_toc_markdown_batches(mut pages: Vec<TocPageMarkdown>) -> Result<Vec<TocPageMarkdown>> {
+    if pages.is_empty() {
+        bail!("no TOC markdown pages were returned");
     }
 
-    let mut notes = Vec::new();
-    let mut entries = Vec::new();
-    let mut toc_found = false;
-    let mut toc_start_page = None;
-    let mut toc_end_page = None;
-
-    for batch in batches.drain(..) {
-        toc_found |= batch.toc_found;
-        toc_start_page = match (toc_start_page, batch.toc_start_page) {
-            (Some(current), Some(next)) => Some(current.min(next)),
-            (None, some) | (some, None) => some,
-        };
-        toc_end_page = match (toc_end_page, batch.toc_end_page) {
-            (Some(current), Some(next)) => Some(current.max(next)),
-            (None, some) | (some, None) => some,
-        };
-        if let Some(note) = batch.notes {
-            let trimmed = note.trim();
-            if !trimmed.is_empty() {
-                notes.push(trimmed.to_string());
-            }
-        }
-        entries.extend(batch.entries);
-    }
-
-    if !toc_found {
-        entries.clear();
-        toc_start_page = None;
-        toc_end_page = None;
-    }
-
-    Ok(TocExtraction {
-        toc_found,
-        toc_start_page,
-        toc_end_page,
-        entries,
-        notes: (!notes.is_empty()).then(|| notes.join("\n")),
-    })
-}
-
-fn merge_toc_structure_extractions(
-    mut batches: Vec<TocStructureExtraction>,
-) -> Result<TocStructureExtraction> {
-    if batches.is_empty() {
-        bail!("no TOC structure batches were returned");
-    }
-
-    let mut notes = Vec::new();
-    let mut levels: Vec<TocStructureLevel> = Vec::new();
-    let mut toc_found = false;
-
-    for batch in batches.drain(..) {
-        toc_found |= batch.toc_found;
-        if let Some(note) = batch.notes {
-            let trimmed = note.trim();
-            if !trimmed.is_empty() {
-                notes.push(trimmed.to_string());
-            }
-        }
-
-        for mut level in batch.levels {
-            level.level = level.level.max(1);
-            level.description = collapse_inline_whitespace(&level.description);
-            level.examples = level
-                .examples
-                .into_iter()
-                .map(|example| collapse_inline_whitespace(&example))
-                .filter(|example| !example.is_empty())
-                .take(3)
-                .collect();
-
-            if level.description.is_empty() {
-                continue;
-            }
-
-            if let Some(existing) = levels.iter_mut().find(|existing| {
-                existing.level == level.level
-                    && normalize_structure_description(&existing.description)
-                        == normalize_structure_description(&level.description)
-            }) {
-                for example in level.examples {
-                    if !existing.examples.iter().any(|current| current == &example) {
-                        existing.examples.push(example);
-                    }
-                    if existing.examples.len() >= 4 {
-                        break;
-                    }
-                }
-            } else {
-                levels.push(level);
-            }
-        }
-    }
-
-    if !toc_found {
-        levels.clear();
-    }
-
-    levels.sort_by(|left, right| {
-        left.level
-            .cmp(&right.level)
-            .then_with(|| left.description.cmp(&right.description))
-    });
-
-    Ok(TocStructureExtraction {
-        toc_found,
-        notes: (!notes.is_empty()).then(|| notes.join("\n")),
-        levels,
-    })
+    pages.sort_by_key(|page| page.physical_page);
+    pages.dedup_by_key(|page| page.physical_page);
+    Ok(pages)
 }
 
 fn merge_vision_observation_batches(
@@ -651,124 +673,32 @@ fn build_multimodal_message(pages: &[RenderedPage], instruction: &str) -> Result
     })
 }
 
-pub fn build_fallback_toc_structure_guide(structure: &TocStructureExtraction) -> TocStructureGuide {
-    let levels = structure
-        .levels
-        .iter()
-        .map(|level| TocStructureGuideLevel {
-            level: level.level.max(1),
-            parent_level: (level.level > 1).then_some(level.level - 1),
-            description: collapse_inline_whitespace(&level.description),
-            numbering_patterns: infer_numbering_patterns_from_examples(&level.examples),
-            examples: level
-                .examples
-                .iter()
-                .map(|example| collapse_inline_whitespace(example))
-                .filter(|example| !example.is_empty())
-                .take(3)
-                .collect(),
-            notes: Some("fallback guide derived from merged batch structure".to_string()),
-        })
-        .collect();
+fn build_toc_markdown_transcription_message(pages: &[TocPageEvidence]) -> Result<Message> {
+    let mut content = Vec::with_capacity(1 + pages.len() * 4);
+    content.push(UserContent::text(
+        "Transcribe each TOC page into a standalone high-fidelity markdown page record.",
+    ));
 
-    TocStructureGuide {
-        toc_found: structure.toc_found,
-        notes: structure
-            .notes
-            .as_ref()
-            .map(|notes| collapse_inline_whitespace(notes)),
-        levels,
-    }
-}
-
-pub fn guide_covers_structure(
-    structure: &TocStructureExtraction,
-    guide: &TocStructureGuide,
-) -> bool {
-    let structure_levels = structure
-        .levels
-        .iter()
-        .filter_map(|level| (!level.description.trim().is_empty()).then_some(level.level.max(1)))
-        .collect::<BTreeSet<_>>();
-    let guide_levels = guide
-        .levels
-        .iter()
-        .filter_map(|level| (!level.description.trim().is_empty()).then_some(level.level.max(1)))
-        .collect::<BTreeSet<_>>();
-
-    structure_levels.is_subset(&guide_levels)
-}
-
-pub fn toc_structure_guide_is_reliable(
-    structure: &TocStructureExtraction,
-    guide: &TocStructureGuide,
-) -> bool {
-    if !guide.toc_found {
-        return !structure.toc_found || structure.levels.is_empty();
+    for page in pages {
+        content.push(UserContent::text(format!(
+            "PDF physical page {}\n---BEGIN PDF TEXT---\n{}\n---END PDF TEXT---\n---BEGIN OCR TEXT---\n{}\n---END OCR TEXT---",
+            page.physical_page,
+            page.pdf_text.as_deref().unwrap_or("[[none]]"),
+            page.ocr_text.as_deref().unwrap_or("[[none]]"),
+        )));
+        content.push(UserContent::Image(Image {
+            data: rig::message::DocumentSourceKind::base64(
+                &BASE64_STANDARD.encode(&page.rendered_page.png_bytes),
+            ),
+            media_type: Some(ImageMediaType::PNG),
+            detail: Some(ImageDetail::High),
+            additional_params: None,
+        }));
     }
 
-    if guide.levels.is_empty() {
-        return false;
-    }
-
-    let mut seen = BTreeSet::new();
-    for level in &guide.levels {
-        let current_level = level.level.max(1);
-        if !seen.insert(current_level) {
-            return false;
-        }
-        if collapse_inline_whitespace(&level.description).is_empty() {
-            return false;
-        }
-        if current_level == 1 {
-            if level.parent_level.is_some() {
-                return false;
-            }
-        } else {
-            let Some(parent_level) = level.parent_level else {
-                return false;
-            };
-            if parent_level >= current_level || parent_level == 0 {
-                return false;
-            }
-        }
-    }
-
-    if !guide_covers_structure(structure, guide) {
-        return false;
-    }
-
-    for level in &guide.levels {
-        if let Some(parent_level) = level.parent_level
-            && !seen.contains(&parent_level)
-        {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn build_toc_extraction_instruction(
-    guide: Option<&TocStructureGuide>,
-) -> Result<String> {
-    let mut instruction =
-        "Determine whether these PDF pages contain a table of contents, then extract it."
-            .to_string();
-
-    let Some(guide) = guide.filter(|guide| guide.toc_found && !guide.levels.is_empty())
-    else {
-        return Ok(instruction);
-    };
-
-    let serialized = serde_json::to_string_pretty(guide)
-        .context("failed to serialize final TOC structure guide for extraction")?;
-    instruction.push_str(
-        "\n\nUse this final normalized TOC structure guide when assigning the `level` field. Prefer this guide over local page-only guesses. Only deviate when the visible page evidence clearly conflicts with the guide. The guide may mention parent or sibling levels that are not visible in this specific batch.\n\n---BEGIN FINAL TOC STRUCTURE GUIDE JSON---\n",
-    );
-    instruction.push_str(&serialized);
-    instruction.push_str("\n---END FINAL TOC STRUCTURE GUIDE JSON---");
-    Ok(instruction)
+    Ok(Message::User {
+        content: OneOrMany::many(content).context("TOC markdown prompt cannot be empty")?,
+    })
 }
 
 fn build_text_page_message(pages: &[ExtractedPageText], instruction: &str) -> Result<Message> {
@@ -787,70 +717,55 @@ fn build_text_page_message(pages: &[ExtractedPageText], instruction: &str) -> Re
     })
 }
 
-fn collapse_inline_whitespace(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn normalize_structure_description(value: &str) -> String {
-    collapse_inline_whitespace(value).to_ascii_lowercase()
-}
-
-fn build_toc_structure_guide_message(
-    structure: &TocStructureExtraction,
-    instruction: &str,
+fn build_toc_markdown_extraction_message(
+    document: &TocMarkdownDocument,
+    review_results: &[VisualReviewResult],
 ) -> Result<Message> {
-    let serialized = serde_json::to_string_pretty(structure)
-        .context("failed to serialize merged TOC structure for final organization")?;
-    let content = vec![UserContent::text(format!(
-        "{instruction}\n\n---BEGIN MERGED TOC STRUCTURE JSON---\n{serialized}\n---END MERGED TOC STRUCTURE JSON---"
-    ))];
+    let mut body = format!(
+        "Extract the TOC from this combined markdown document.\n\n---BEGIN TOC MARKDOWN---\n{}\n---END TOC MARKDOWN---",
+        document.combined_markdown
+    );
+    if let Some(review_appendix) = format_toc_review_appendix(review_results) {
+        body.push_str("\n\n");
+        body.push_str(&review_appendix);
+    }
 
     Ok(Message::User {
-        content: OneOrMany::many(content).context("TOC structure guide prompt cannot be empty")?,
+        content: OneOrMany::many(vec![UserContent::text(body)])
+            .context("TOC markdown extraction prompt cannot be empty")?,
     })
 }
 
-fn infer_numbering_patterns_from_examples(examples: &[String]) -> Vec<String> {
-    let mut patterns = BTreeSet::new();
-    for example in examples {
-        let trimmed = collapse_inline_whitespace(example);
-        if trimmed.is_empty() {
-            continue;
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        if lower.starts_with("chapter ") {
-            patterns.insert("Chapter N".to_string());
-        } else if lower.starts_with("appendix ") {
-            patterns.insert("Appendix A".to_string());
-        } else if let Some(prefix) = trimmed.split_whitespace().next() {
-            if prefix
-                .chars()
-                .all(|ch| ch.is_ascii_digit() || ch == '.')
-                && prefix.chars().any(|ch| ch.is_ascii_digit())
-            {
-                patterns.insert(if prefix.contains('.') {
-                    "1.1".to_string()
-                } else {
-                    "1".to_string()
-                });
-                continue;
-            }
-            if prefix.chars().all(|ch| matches!(ch, 'I' | 'V' | 'X' | 'L' | 'C' | 'D' | 'M'))
-                || prefix
-                    .chars()
-                    .all(|ch| matches!(ch, 'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm'))
-            {
-                patterns.insert("I".to_string());
-                continue;
-            }
-        }
+fn build_visual_review_message(
+    requests: &[VisualReviewRequest],
+    pages: &[RenderedPage],
+    document: &TocMarkdownDocument,
+) -> Result<Message> {
+    let requests_json = serde_json::to_string_pretty(requests)
+        .context("failed to serialize visual review requests")?;
+    let mut content = Vec::with_capacity(2 + pages.len() * 2);
+    content.push(UserContent::text(format!(
+        "Clarify the requested ambiguous TOC regions.\n\n---BEGIN REVIEW REQUESTS JSON---\n{requests_json}\n---END REVIEW REQUESTS JSON---\n\n---BEGIN TOC MARKDOWN---\n{}\n---END TOC MARKDOWN---",
+        document.combined_markdown
+    )));
+    for page in pages {
+        content.push(UserContent::text(format!(
+            "PDF physical page {}",
+            page.physical_page
+        )));
+        content.push(UserContent::Image(Image {
+            data: rig::message::DocumentSourceKind::base64(
+                &BASE64_STANDARD.encode(&page.png_bytes),
+            ),
+            media_type: Some(ImageMediaType::PNG),
+            detail: Some(ImageDetail::High),
+            additional_params: None,
+        }));
     }
 
-    if patterns.is_empty() {
-        patterns.insert("none".to_string());
-    }
-
-    patterns.into_iter().collect()
+    Ok(Message::User {
+        content: OneOrMany::many(content).context("visual review prompt cannot be empty")?,
+    })
 }
 
 fn build_openai_client(config: &LlmConfig) -> Result<openai::CompletionsClient> {
@@ -896,6 +811,7 @@ async fn stream_structured_output<T>(
 where
     T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
 {
+    let started_at = Instant::now();
     let client = build_openai_client(config)?;
     let model = config.model.as_deref().unwrap_or(openai::GPT_4O_MINI);
     let agent = client
@@ -950,8 +866,8 @@ where
         &output_window.render(),
     );
 
-    let (data, repair_usage) = match serde_json::from_str::<T>(&final_text) {
-        Ok(data) => (data, Usage::new()),
+    let (data, repaired_output, repair_usage) = match serde_json::from_str::<T>(&final_text) {
+        Ok(data) => (data, None, Usage::new()),
         Err(initial_error) => {
             let (repaired_json, repair_usage) =
                 repair_structured_output::<T>(&client, model, &final_text).await?;
@@ -961,16 +877,24 @@ where
                     repaired_json
                 )
             })?;
-            (data, repair_usage)
+            (data, Some(repaired_json), repair_usage)
         }
     };
     usage += repair_usage;
     let response: ExtractionResponse<T> = ExtractionResponse { data, usage };
+    let structured_output = serde_json::to_string_pretty(&response.data)
+        .context("failed to serialize structured output trace")?;
 
     Ok(LlmCall {
         data: response.data,
         usage: response.usage,
         calls: 1,
+        trace: Some(StructuredOutputTrace {
+            raw_output: final_text,
+            repaired_output,
+            structured_output,
+            duration_ms: started_at.elapsed().as_millis() as u64,
+        }),
     })
 }
 
@@ -1092,6 +1016,7 @@ where
         data: merged,
         usage,
         calls,
+        trace: None,
     })
 }
 
@@ -1160,6 +1085,15 @@ where
     }
 
     Ok(results)
+}
+
+fn pop_queued_evidence_batch(
+    queue: &Arc<Mutex<VecDeque<QueuedEvidenceBatch>>>,
+) -> Result<Option<QueuedEvidenceBatch>> {
+    queue
+        .lock()
+        .map_err(|_| anyhow::anyhow!("markdown batch queue lock poisoned"))
+        .map(|mut queue| queue.pop_front())
 }
 
 fn pop_queued_batch(queue: &Arc<Mutex<VecDeque<QueuedBatch>>>) -> Result<Option<QueuedBatch>> {
@@ -1239,6 +1173,31 @@ fn batch_page_range_label(pages: &[RenderedPage]) -> String {
     } else {
         format!("page {first}..{last}")
     }
+}
+
+fn evidence_page_range_label(pages: &[TocPageEvidence]) -> String {
+    let Some(first) = pages.first().map(|page| page.physical_page) else {
+        return "page ?".to_string();
+    };
+    let last = pages.last().map(|page| page.physical_page).unwrap_or(first);
+    if first == last {
+        format!("page {first}")
+    } else {
+        format!("page {first}..{last}")
+    }
+}
+
+fn build_toc_markdown_worker_input_summary(pages: &[TocPageEvidence]) -> String {
+    let mut sections = Vec::with_capacity(pages.len());
+    for page in pages {
+        sections.push(format!(
+            "PDF physical page {}\n[pdf_text]\n{}\n[ocr_text]\n{}",
+            page.physical_page,
+            page.pdf_text.as_deref().unwrap_or("[[none]]"),
+            page.ocr_text.as_deref().unwrap_or("[[none]]")
+        ));
+    }
+    sections.join("\n\n")
 }
 
 struct OutputWindow {
@@ -1420,12 +1379,9 @@ mod tests {
 
     use super::{
         LlmConfig, ObservedPrintedPageLabel, OutputWindow, RenderedPage, TocDirectionHint,
-        TocStructureExtraction, TocStructureGuide, TocStructureGuideLevel, TocStructureLevel,
         VisionRequestConfig, batch_page_range_label, bind_page_label_observations,
-        build_fallback_toc_structure_guide, build_openai_client,
-        build_toc_extraction_instruction, display_width, guide_covers_structure,
-        identify_toc_pages, merge_toc_structure_extractions, take_prefix_width,
-        take_suffix_width, toc_structure_guide_is_reliable,
+        build_openai_client, display_width, identify_toc_pages, take_prefix_width,
+        take_suffix_width,
     };
     use crate::config::{CliArgs, resolve_args};
     use crate::pdf_support::PdfWorkspace;
@@ -1449,6 +1405,7 @@ mod tests {
             model: None,
             config: None,
             toc: None,
+            trace: None,
             vision_worker_batch_size: None,
             vision_workers: None,
             external_process_concurrency: None,
@@ -1639,130 +1596,6 @@ mod tests {
         assert_eq!(bound[0].printed_page_label.as_deref(), Some("1"));
         assert_eq!(bound[1].physical_page, 15);
         assert_eq!(bound[1].printed_page_label.as_deref(), Some("4"));
-    }
-
-    #[test]
-    fn merge_toc_structure_extractions_deduplicates_level_descriptions() {
-        let merged = merge_toc_structure_extractions(vec![
-            TocStructureExtraction {
-                toc_found: true,
-                notes: Some("batch 1".to_string()),
-                levels: vec![TocStructureLevel {
-                    level: 1,
-                    description: "Chapter level".to_string(),
-                    examples: vec!["Chapter 1".to_string()],
-                }],
-            },
-            TocStructureExtraction {
-                toc_found: true,
-                notes: Some("batch 2".to_string()),
-                levels: vec![
-                    TocStructureLevel {
-                        level: 1,
-                        description: "chapter   level".to_string(),
-                        examples: vec!["Chapter 2".to_string()],
-                    },
-                    TocStructureLevel {
-                        level: 2,
-                        description: "Section level".to_string(),
-                        examples: vec!["1.1 Intro".to_string()],
-                    },
-                ],
-            },
-        ])
-        .expect("structure batches should merge");
-
-        assert!(merged.toc_found);
-        assert_eq!(merged.levels.len(), 2);
-        assert_eq!(merged.levels[0].level, 1);
-        assert_eq!(merged.levels[0].examples, vec!["Chapter 1", "Chapter 2"]);
-        assert_eq!(merged.levels[1].level, 2);
-        assert_eq!(merged.notes.as_deref(), Some("batch 1\nbatch 2"));
-    }
-
-    #[test]
-    fn fallback_guide_preserves_structure_levels() {
-        let structure = TocStructureExtraction {
-            toc_found: true,
-            notes: Some("merged".to_string()),
-            levels: vec![
-                TocStructureLevel {
-                    level: 1,
-                    description: "Chapter level".to_string(),
-                    examples: vec!["Chapter 1".to_string()],
-                },
-                TocStructureLevel {
-                    level: 2,
-                    description: "Section level".to_string(),
-                    examples: vec!["1.1 Intro".to_string()],
-                },
-            ],
-        };
-
-        let guide = build_fallback_toc_structure_guide(&structure);
-
-        assert!(guide.toc_found);
-        assert_eq!(guide.levels.len(), 2);
-        assert_eq!(guide.levels[0].parent_level, None);
-        assert_eq!(guide.levels[1].parent_level, Some(1));
-        assert!(guide_covers_structure(&structure, &guide));
-        assert!(toc_structure_guide_is_reliable(&structure, &guide));
-    }
-
-    #[test]
-    fn unreliable_guide_is_rejected_when_it_drops_levels() {
-        let structure = TocStructureExtraction {
-            toc_found: true,
-            notes: None,
-            levels: vec![
-                TocStructureLevel {
-                    level: 1,
-                    description: "Chapter level".to_string(),
-                    examples: vec!["Chapter 1".to_string()],
-                },
-                TocStructureLevel {
-                    level: 2,
-                    description: "Section level".to_string(),
-                    examples: vec!["1.1 Intro".to_string()],
-                },
-            ],
-        };
-        let guide = TocStructureGuide {
-            toc_found: true,
-            notes: None,
-            levels: vec![TocStructureGuideLevel {
-                level: 1,
-                parent_level: None,
-                description: "Chapter level".to_string(),
-                numbering_patterns: vec!["Chapter N".to_string()],
-                examples: vec!["Chapter 1".to_string()],
-                notes: None,
-            }],
-        };
-
-        assert!(!guide_covers_structure(&structure, &guide));
-        assert!(!toc_structure_guide_is_reliable(&structure, &guide));
-    }
-
-    #[test]
-    fn toc_extraction_instruction_embeds_final_structure_guide() {
-        let instruction = build_toc_extraction_instruction(Some(&TocStructureGuide {
-            toc_found: true,
-            notes: None,
-            levels: vec![TocStructureGuideLevel {
-                level: 1,
-                parent_level: None,
-                description: "Chapter level".to_string(),
-                numbering_patterns: vec!["Chapter N".to_string()],
-                examples: vec!["Chapter 1".to_string()],
-                notes: None,
-            }],
-        }))
-        .expect("instruction should build");
-
-        assert!(instruction.contains("FINAL TOC STRUCTURE GUIDE JSON"));
-        assert!(instruction.contains("Chapter level"));
-        assert!(instruction.contains("Chapter 1"));
     }
 
     #[test]
