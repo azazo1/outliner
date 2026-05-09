@@ -174,11 +174,14 @@ impl PageRangeSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TocExtraction {
-    #[schemars(required)]
+    #[schemars(
+        required,
+        description = "Whether you found the table of content in the provided material."
+    )]
     pub toc_found: bool,
     #[schemars(
         required,
-        description = "The first TOC page as a 1-based PDF physical page number. This is not the printed page label shown inside the book. Use a positive integer within the provided TOC document page range. Never use 0 or a negative value. Should not be null when toc_found is true. It's provided by `# TOC Page`."
+        description = "The first table of content (TOC) page as a 1-based PDF physical page number. This is not the printed page label shown inside the book. Use a positive integer within the provided TOC document page range. Never use 0 or a negative value. Should not be null when toc_found is true. It's provided by `# TOC Page <N>`."
     )]
     pub toc_start_page: Option<usize>,
     #[schemars(
