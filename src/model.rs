@@ -176,17 +176,17 @@ impl PageRangeSpec {
 pub struct TocExtraction {
     #[schemars(
         required,
-        description = "Whether you found the table of content in the provided material."
+        description = "当你从提供的材料中找到了目录的时候, 请返回 true, 并填写 first_toc_page 和 last_toc_page"
     )]
     pub toc_found: bool,
     #[schemars(
         required,
-        description = "The first TOC page, it refers to TOC itself's position in the whole pdf, not the TOC containing range. It's provided in `# TOC Page <N>`."
+        description = "TOC 第一页在哪? 你需要在 `# TOC Page <N>` 中提取 N 来填写. 当 toc_found = true 的时候不应该为空."
     )]
     pub first_toc_page: Option<usize>,
     #[schemars(
         required,
-        description = "Same with first_toc_page, but the last TOC page."
+        description = "TOC 最后一页在哪? 你需要在 `# TOC Page <N>` 中提取 N 来填写. 当 toc_found = true 的时候不应该为空."
     )]
     pub last_toc_page: Option<usize>,
     #[schemars(required)]
