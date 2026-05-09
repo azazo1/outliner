@@ -691,10 +691,9 @@ fn build_toc_markdown_transcription_message(pages: &[TocPageEvidence]) -> Result
 
     for page in pages {
         content.push(UserContent::text(format!(
-            "PDF physical page {}\n---BEGIN PDF TEXT---\n{}\n---END PDF TEXT---\n---BEGIN OCR TEXT---\n{}\n---END OCR TEXT---",
+            "PDF physical page {}\n---BEGIN PDF TEXT---\n{}\n---END PDF TEXT---",
             page.physical_page,
             page.pdf_text.as_deref().unwrap_or("[[none]]"),
-            page.ocr_text.as_deref().unwrap_or("[[none]]"),
         )));
         content.push(UserContent::Image(Image {
             data: rig::message::DocumentSourceKind::base64(

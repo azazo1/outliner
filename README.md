@@ -173,7 +173,7 @@ outliner [OPTIONS] <INPUT>
 - [`src/llm.rs`](/Users/azazo1/pjs/rust/outliner/src/llm.rs) 负责五类请求:
   - 基于页面文字的 TOC 定位判断
   - 基于页面图片的 TOC 定位和正文页码观测
-  - 基于 `pdf_text + OCR + 原图` 的 TOC 页高保真 markdown 转写
+  - 基于 `pdf_text + 原图` 的 TOC 页高保真 markdown 转写
   - 基于合并后的 TOC markdown 文档做一次全局目录提取
   - 必要时对 markdown 中不清晰的局部区域做定向视觉复核
 - 目录定位时, 模型不会只回答"像不像目录", 而是必须对每个采样页返回 `hit`, `before`, `after`, `unknown` 之一
@@ -220,8 +220,8 @@ outliner [OPTIONS] <INPUT>
 5. 如果内嵌文字不足, 对同一批页执行 OCR, 再让 LLM 判断一次
 6. 如果 OCR 仍不足以定位, 再把采样页渲染成 PNG, 交给多模态 LLM 判断目录命中页或方向
 7. 根据 `hit` 或 `before/after` 提示缩小目录候选范围, 必要时重复采样和定位
-8. 渲染候选目录页, 同时收集这些页的 `pdftotext` 文字和 OCR 文字
-9. 把每个目录页的 `pdf_text + OCR + 原图` 送给视觉 LLM, 转写成带 `Layout:` 和 `Region` 分块的高保真 markdown 页面
+8. 渲染候选目录页, 同时收集这些页的 `pdftotext` 文字
+9. 把每个目录页的 `pdf_text + 原图` 送给视觉 LLM, 转写成带 `Layout:` 和 `Region` 分块的高保真 markdown 页面
 10. 按物理页顺序把这些页面 markdown 合并成一个完整的 TOC markdown 文档
 11. 让 LLM 只基于这份 TOC markdown 文档做一次全局目录提取, 输出条目, 层级和印刷页码
 12. 如果模型认为某些局部证据不清晰, 先返回复核请求, 程序会预取请求页和前一页原图, 做一次定向视觉复核, 然后再重跑一次目录提取

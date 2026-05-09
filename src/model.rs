@@ -19,7 +19,6 @@ pub struct ExtractedPageText {
 pub struct TocPageEvidence {
     pub physical_page: usize,
     pub pdf_text: Option<String>,
-    pub ocr_text: Option<String>,
     pub rendered_page: RenderedPage,
 }
 
@@ -385,20 +384,6 @@ pub fn collapse_inline_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn dedupe_optional_text_pair(
-    left: Option<String>,
-    right: Option<String>,
-) -> (Option<String>, Option<String>) {
-    match (left, right) {
-        (Some(left_text), Some(right_text))
-            if normalize_dedup_text(&left_text) == normalize_dedup_text(&right_text) =>
-        {
-            (Some(left_text), None)
-        }
-        (left, right) => (left, right),
-    }
-}
-
 pub fn markdown_context_budget_exceeded(markdown: &str) -> bool {
     markdown.chars().count() > 120_000
 }
@@ -495,10 +480,6 @@ fn extract_roman_page_number(value: &str) -> Option<String> {
         .filter(|roman| is_roman_numeral(roman))
 }
 
-fn normalize_dedup_text(input: &str) -> String {
-    collapse_inline_whitespace(input).to_ascii_lowercase()
-}
-
 fn lookup_numbering_level(
     level_map: &[(SectionNumbering, usize)],
     numbering: &SectionNumbering,
@@ -576,8 +557,8 @@ fn roman_to_number(value: &str) -> Option<usize> {
 mod tests {
     use super::{
         PageLabel, PageRange, PageRangeSpec, TocCandidateEntry, TocMarkdownDocument,
-        TocPageMarkdown, clean_title, dedupe_optional_text_pair, extract_leading_numbering,
-        normalize_toc_entries, parse_page_label, render_toc_markdown_page, sanitize_title,
+        TocPageMarkdown, clean_title, extract_leading_numbering, normalize_toc_entries,
+        parse_page_label, render_toc_markdown_page, sanitize_title,
     };
 
     #[test]
@@ -720,17 +701,6 @@ mod tests {
             .resolve(20),
             Some(PageRange { start: 1, end: 4 })
         );
-    }
-
-    #[test]
-    fn duplicate_pdf_and_ocr_text_is_deduplicated() {
-        let (pdf_text, ocr_text) = dedupe_optional_text_pair(
-            Some("目录  第一章".to_string()),
-            Some("目录 第一章".to_string()),
-        );
-
-        assert_eq!(pdf_text, Some("目录  第一章".to_string()));
-        assert_eq!(ocr_text, None);
     }
 
     #[test]

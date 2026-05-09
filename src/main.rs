@@ -29,8 +29,8 @@ use crate::{
     model::{
         DebugTraceStageRecord, DebugTraceUsageSnapshot, ExtractedPageText, OutlineEntry,
         PageRange, RenderedPage, RunOutcome, TocMarkdownDocument, TocPageEvidence,
-        TocPageMarkdown, VisualReviewRequest, dedupe_optional_text_pair,
-        markdown_context_budget_exceeded, normalize_outline_for_compare, normalize_toc_entries,
+        TocPageMarkdown, VisualReviewRequest, markdown_context_budget_exceeded,
+        normalize_outline_for_compare, normalize_toc_entries,
     },
     pdf_support::{PdfWorkspace, is_toc_hit},
     progress::{
@@ -304,62 +304,12 @@ async fn run(args: AppArgs, trace_recorder: &DebugTraceRecorder) -> Result<RunOu
     set_run_status(
         &run_span,
         &args.input,
-        "OCRing TOC pages",
-        &agent_progress.usage,
-        agent_progress.calls,
-    );
-    let toc_ocr_span = start_bar(
-        "ocr_toc_pages",
-        toc_pages.len() as u64,
-        format!("OCRing TOC pages {}", toc_pages.len()),
-    );
-    let ocr_toc_text = match workspace
-        .ocr_page_text_with_progress(&toc_pages, |completed, physical_page| {
-            toc_ocr_span.pb_set_position(completed as u64);
-            set_bar_message(
-                &toc_ocr_span,
-                format!(
-                    "OCRing TOC page {physical_page} ({completed}/{})",
-                    toc_pages.len()
-                ),
-            );
-        })
-        .await
-    {
-        Ok(pages) => pages,
-        Err(error) => {
-            tracing::warn!(error = %error, "TOC OCR extraction failed");
-            Vec::new()
-        }
-    };
-    drop(toc_ocr_span);
-    finish_stage(
-        &run_span,
-        &args.input,
-        "TOC OCR ready",
-        &agent_progress.usage,
-        agent_progress.calls,
-    );
-    record_text_stage(
-        trace_recorder,
-        "ocr_toc_pages",
-        &ocr_toc_text,
-        &agent_progress.usage,
-    )?;
-
-    set_run_status(
-        &run_span,
-        &args.input,
         "preparing TOC evidence",
         &agent_progress.usage,
         agent_progress.calls,
     );
     let evidence_span = start_spinner("collect_toc_page_evidence", "preparing TOC evidence");
-    let toc_evidence = build_toc_page_evidence(
-        &rendered_toc_pages,
-        &extracted_toc_text,
-        &ocr_toc_text,
-    );
+    let toc_evidence = build_toc_page_evidence(&rendered_toc_pages, &extracted_toc_text);
     drop(evidence_span);
     finish_stage(
         &run_span,
@@ -1314,13 +1264,8 @@ fn format_rendered_page_range(pages: &[crate::model::RenderedPage]) -> String {
 fn build_toc_page_evidence(
     rendered_pages: &[RenderedPage],
     extracted_pages: &[ExtractedPageText],
-    ocr_pages: &[ExtractedPageText],
 ) -> Vec<TocPageEvidence> {
     let extracted_by_page = extracted_pages
-        .iter()
-        .map(|page| (page.physical_page, page.text.clone()))
-        .collect::<HashMap<_, _>>();
-    let ocr_by_page = ocr_pages
         .iter()
         .map(|page| (page.physical_page, page.text.clone()))
         .collect::<HashMap<_, _>>();
@@ -1328,14 +1273,9 @@ fn build_toc_page_evidence(
     rendered_pages
         .iter()
         .map(|rendered_page| {
-            let (pdf_text, ocr_text) = dedupe_optional_text_pair(
-                extracted_by_page.get(&rendered_page.physical_page).cloned(),
-                ocr_by_page.get(&rendered_page.physical_page).cloned(),
-            );
             TocPageEvidence {
                 physical_page: rendered_page.physical_page,
-                pdf_text,
-                ocr_text,
+                pdf_text: extracted_by_page.get(&rendered_page.physical_page).cloned(),
                 rendered_page: rendered_page.clone(),
             }
         })
@@ -1358,10 +1298,9 @@ fn summarize_toc_evidence(pages: &[TocPageEvidence]) -> String {
     pages.iter()
         .map(|page| {
             format!(
-                "PDF physical page {}\n[pdf_text]\n{}\n[ocr_text]\n{}",
+                "PDF physical page {}\n[pdf_text]\n{}",
                 page.physical_page,
                 page.pdf_text.as_deref().unwrap_or("[[none]]"),
-                page.ocr_text.as_deref().unwrap_or("[[none]]")
             )
         })
         .collect::<Vec<_>>()
@@ -1654,9 +1593,9 @@ fn same_path(left: &Path, right: &Path) -> bool {
 
 fn stage_count_for(args: &AppArgs) -> u64 {
     if args.toc.is_some_and(|spec| spec.is_fully_bounded()) {
-        11
+        10
     } else {
-        13
+        12
     }
 }
 
@@ -1774,7 +1713,7 @@ mod tests {
             vision_workers: 4,
             external_process_concurrency: 4,
         };
-        assert_eq!(stage_count_for(&args), 11);
+        assert_eq!(stage_count_for(&args), 10);
     }
 
     #[test]
