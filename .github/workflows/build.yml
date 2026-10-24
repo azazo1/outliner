@@ -1,0 +1,42 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: macos-aarch64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install qpdf (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libqpdf-dev
+      - name: Install qpdf (macOS)
+        if: runner.os == 'macOS'
+        run: brew install qpdf
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Stage binary
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/outliner" dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: outliner-${{ matrix.platform }}
+          path: dist/*
